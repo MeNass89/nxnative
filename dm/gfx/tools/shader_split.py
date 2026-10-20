@@ -125,7 +125,9 @@ def glslc_shaders(d, label, need=True):
         if c < 0 or d.find(CTL_MAGIC, c + 4, h + size) >= 0: continue
         nctl, ncode = struct.unpack_from('<I', d, c + 0x20)[0], struct.unpack_from('<I', d, c + 0x704)[0]
         if nctl < 0x760 or nctl & 3 or c + nctl + ncode > h + size: continue
-        ctl, code = d[c:c + nctl], d[c + nctl:c + nctl + ncode]
+        # SDK 4's GLSLC (Dark Souls Remastered) writes a 12-byte record {0x0020000a, 0x20, 0x10} between the control section and the code area
+        pre = 12 if d[c + nctl:c + nctl + 12] == bytes.fromhex('0a0020002000000010000000') and d[c + nctl + 12:c + nctl + 16] in (GFX_MAGIC, CS_MAGIC) and c + nctl + 12 + ncode <= h + size else 0
+        ctl, code = d[c:c + nctl], d[c + nctl + pre:c + nctl + pre + ncode]
         headerless_cs = code[:4] not in (CS_MAGIC, GFX_MAGIC) and all(struct.unpack_from('<3I', ctl, 0x748))
         st = 'cs' if code[:4] == CS_MAGIC or headerless_cs else SPH_STAGE.get((struct.unpack_from('<I', code, 0x30)[0] >> 10) & 0xf) if code[:4] == GFX_MAGIC else None
         if not st or check(label, st, ctl, code): continue

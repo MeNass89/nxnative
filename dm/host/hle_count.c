@@ -1,3 +1,5 @@
+#include <pthread.h>
+#include <unistd.h>
 // DM_HLECOUNT=<output file, may contain %d = process id> (Mac diagnostic, for HLE coverage audit): count how many times each HLE is called by the guest and write a TSV "category name count" on exit (including 0 counts).
 // Method: at load time, resolve guest references to host implementations (forced takeover / HLE table / libc passthrough / unimplemented stubs) to a counting stub:
 //   ldr x16, =&count; movz x17, #1; stadd x17, [x16]; ldr x16, =implementation; br x16
@@ -22,12 +24,14 @@ static void hc_write(void) {
     for (int k = 0; k < 256; k++) if (atomic_load(&g_hsvc[k])) fprintf(f, "SVC\t%#x\t%llu\n", k, (unsigned long long)atomic_load(&g_hsvc[k]));
     fclose(f); LOG("DM_HLECOUNT: %u entries → %s", g_nhc, pth);
 }
+// Runs ended by a time limit (SIGALRM) never reach atexit: rewrite the table every 5 s
+static void *hc_flush_main(void *a) { (void)a; for (;;) { sleep(5); hc_write(); } return NULL; }
 void *hlecount_wrap(const char *kind, const char *name, void *fn) {
     if (!hc_on() || !fn) return fn;
     if (g_hsealed) { static int once; if (!once++) LOG("[RED] DM_HLECOUNT: resolution after the pages were sealed (%s), later entries are not counted", name); return fn; }
     for (unsigned i = 0; i < g_nhc; i++) if (g_hc[i].fn == fn && !strcmp(g_hc[i].name, name)) return g_hcode + 12 * i;   // Same name and same implementation reuse one stub
     if (g_nhc == HC_MAX) die("DM_HLECOUNT more than %d entries", HC_MAX);
-    if (!g_hcode) { g_hcode = mmap(NULL, HC_MAX * 48, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); if (g_hcode == MAP_FAILED) die("DM_HLECOUNT mmap"); atexit(hc_write); }
+    if (!g_hcode) { g_hcode = mmap(NULL, HC_MAX * 48, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); if (g_hcode == MAP_FAILED) die("DM_HLECOUNT mmap"); atexit(hc_write); { pthread_t t; pthread_create(&t, NULL, hc_flush_main, NULL); pthread_detach(t); } }
     unsigned i = g_nhc++; g_hc[i].kind = kind; g_hc[i].name = name; g_hc[i].fn = fn;
     uint32_t *w = g_hcode + 12 * i;                                  // 48 bytes: 5 instructions + 1 empty + two 8-byte literals (offsets 0x18 / 0x20)
     w[0] = 0x58000000 | ((0x18 / 4) << 5) | 16;                      // ldr x16, [pc+0x18]   → &count

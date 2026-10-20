@@ -704,6 +704,10 @@ NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer *c, const NVNevent *e, N
 NVN(nvnCommandBufferResetCounter, void, NVNcommandBuffer *c, NVNcounterType t) {
     uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_RESET_COUNTER, 16); uint64_t tt = t; memcpy(p + 8, &tt, 8);
 }
+// A fence recorded in a command buffer (Dark Souls Remastered fences every frame's command buffer): the sync is fenced when the submission holding it is committed
+NVN(nvnCommandBufferFenceSync, void, NVNcommandBuffer *c, NVNsync *s, NVNsyncCondition cond, int f) { (void)cond; (void)f;
+    uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_FENCE_SYNC, 16); uint64_t v = (uint64_t)s; memcpy(p + 8, &v, 8); }
+
 NVN(nvnCommandBufferReportCounter, void, NVNcommandBuffer *c, NVNcounterType t, NVNbufferAddress a) {
     uint8_t *p = cmd_alloc(CB(c), 24); put_hdr(p, OP_REPORT_COUNTER, 24); uint64_t tt = t; memcpy(p + 8, &tt, 8); memcpy(p + 16, &a, 8);
 }
@@ -994,6 +998,10 @@ void dm_gfx_suspend(int on) {
 // submits on both from two threads; the second submission arrived while the first was replaying and the host stopped with "submit re-entered" at the ninth frame. NVN orders work on different queues only
 // through syncs, so replaying the two queues' submissions in lock order is one valid order
 static pthread_mutex_t g_sub_mu = PTHREAD_MUTEX_INITIALIZER;
+// Command-buffer fences seen during one submission (OP_FENCE_SYNC), fenced with the submission's Metal fence once it is committed (under g_sub_mu)
+static void *g_fence_pend[256]; static int g_nfence_pend;
+void nvn_fence_pending(void *s) { if (g_nfence_pend < 256) g_fence_pend[g_nfence_pend++] = s; else { static int once; if (!once++) LOG("[RED] more than 256 command-buffer fences in one submission"); } }
+static void nvn_fence_flush(uint64_t fence) { for (int i = 0; i < g_nfence_pend; i++) { sync_t *o = g_fence_pend[i]; o->fenced = 1; o->fence = fence; } g_nfence_pend = 0; }
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     gfx_enter();
     pthread_mutex_lock(&g_sub_mu);
@@ -1005,6 +1013,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     for (int i = 0; i < n; i++) { mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }
     mtl_exec_rest(NULL, 0);
     mtl_sub_commit();
+    nvn_fence_flush(mtl_last_fence());
     pthread_mutex_unlock(&g_sub_mu);
     uint64_t dw = now_ns() - t0;
     atomic_fetch_add(&g_nvn_ns, dw); atomic_fetch_add(&g_sub_wall_ns, dw);

@@ -684,7 +684,9 @@ HLE_FORCE("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", "fsp
 HLE_FORCE("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", "fsp-srv → fstat(2)", Result, h_fs_GetFileSize, int64_t *out, uint64_t h) {
     if (!h) return RES_FAIL;
     struct stat st; if (fstat((int)h, &st)) return err_res("fstat", "fd");
-    *out = (int)h < 4096 && g_hm[(int)h] ? g_hm[(int)h]->size : st.st_size; return RES_OK;
+    *out = (int)h < 4096 && g_hm[(int)h] ? g_hm[(int)h]->size : st.st_size;
+    { static int dbg = -1, n; if (dbg < 0) dbg = getenv("DM_FS_SIZE") != NULL; if (dbg && (n++ < 40 || n % 1000 == 0)) LOG("fs GetFileSize #%d fd %d → %lld", n, (int)h, (long long)*out); }
+    return RES_OK;
 }
 HLE_FORCE("_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", "fsp-srv → ftruncate(2)", Result, h_fs_SetFileSize, uint64_t h, int64_t sz) {
     if (!h) return RES_FAIL;

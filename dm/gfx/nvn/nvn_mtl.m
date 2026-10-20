@@ -3114,19 +3114,63 @@ static int vconv_wanted(const nvn_refl *rf, int v, const pso_key *k) {   // does
 }
 // Per submission, one conversion per (range, format, layout): KTGL draws the same mesh several times a frame (depth, shadow, G-buffer)
 static struct { uint64_t addr, size, serial; uint32_t fmt, off, stride; uint64_t gpu; } g_vconv[64]; static int g_vconv_next;
-static void vconv_bind(id<MTL4RenderCommandEncoder> en, const nvn_refl *rf) {
+// Across submissions: a converted range is kept in a buffer of its own and reused while the guest pages it was read from stay unwritten (nvn_dirty_since).
+// Dark Souls Remastered converts its menu and character meshes every frame (16-bit integers into float inputs): 280 M instructions per frame on the submit thread, 9.4 ms of a 33 ms frame.
+// A refill always takes a new buffer (an earlier submission may still be reading the old one, which is released after it completes). Untracked memory is never kept.
+#define VKEEP 256
+static struct { uint64_t addr, size, stamp, gpu; uint32_t fmt, off, stride; const void *span; } g_vkeep[VKEEP]; static id<MTLBuffer> g_vkeep_buf[VKEEP]; static int g_vkeep_next;
+static uint64_t g_vkeep_hit, g_vkeep_miss;
+// The vertices a draw reads: [first, first + count) for a direct non-indexed draw; for a direct indexed draw the smallest and largest index (read from guest memory) plus the base vertex.
+// 0 = unknown (indirect, instanced streams): convert the whole bound range as before. Dark Souls Remastered binds a 2 MB ring of 175,000 vertices and draws a few dozen of them:
+// converting the whole ring for each draw cost 100 ms of CPU per frame in its menus.
+static int vconv_span(const p_draw *dw, const p_draw_idx *di, uint64_t *lo, uint64_t *hi) {
+    if (dw) { if (dw->ind || dw->count <= 0) return 0; *lo = (uint64_t)dw->first; *hi = (uint64_t)dw->first + (uint64_t)dw->count; return 1; }
+    if (!di || di->ind || di->count <= 0) return 0;
+    int isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4; void *m; uint64_t o;
+    if (!mtl_addr(di->ibuf, (uint64_t)di->count * isz, &m, &o)) return 0;
+    const uint8_t *ib = (const uint8_t *)[(__bridge id<MTLBuffer>)m contents]; if (!ib) return 0; ib += o;
+    uint32_t mn = 0xffffffffu, mx = 0;
+    for (int32_t i = 0; i < di->count; i++) { uint32_t v = isz == 1 ? ib[i] : isz == 2 ? ((const uint16_t *)ib)[i] : ((const uint32_t *)ib)[i];
+        if ((isz == 2 && v == 0xffff) || (isz == 4 && v == 0xffffffffu)) continue;   // primitive restart
+        if (v < mn) mn = v; if (v > mx) mx = v; }
+    if (mn > mx) return 0;
+    int64_t a = (int64_t)mn + di->base_vertex, b = (int64_t)mx + di->base_vertex + 1; if (a < 0) return 0;
+    *lo = (uint64_t)a; *hi = (uint64_t)b; return 1;
+}
+static void vconv_bind(id<MTL4RenderCommandEncoder> en, const nvn_refl *rf, const p_draw *dw, const p_draw_idx *di) {
+    uint64_t vlo = 0, vhi = 0; int have_span = vconv_span(dw, di, &vlo, &vhi);
     int slot = VCONV_SLOT0;
     for (int v = 0; v < rf->nv && slot < VCONV_SLOT0 + VCONV_MAX; v++) {
         if (!vconv_wanted(rf, v, NULL) || rf->v[v].nvn >= S.nattr) continue;
         int a = rf->v[v].nvn, st = S.attr[a].stream, f = S.attr[a].fmt; uint32_t off = S.attr[a].offset, stride = st < 16 ? S.stream[st].stride : 0;
-        uint64_t addr = st < 16 ? S.vbuf[st].address : 0, size = st < 16 ? S.vbuf[st].size : 0, gpu = 0;
+        uint64_t addr = st < 16 ? S.vbuf[st].address : 0, size = st < 16 ? S.vbuf[st].size : 0, gpu = 0, skip = 0;
+        if (have_span && stride && st < 16 && !S.stream[st].divisor) {   // only the vertices this draw reads; the buffer bound is offset back so vertex i still lands at element i
+            uint64_t es = (uint64_t)vconv_size(f), lo = vlo, hi = vhi, nmax = size >= off + es ? (size - off - es) / stride + 1 : 0;
+            if (hi > nmax) hi = nmax;
+            if (lo < hi) { skip = lo; addr += lo * stride; size = (hi - lo - 1) * stride + off + es; }
+        }
         for (int i = 0; i < 64 && !gpu; i++) if (g_vconv[i].serial == g_sub_serial && g_vconv[i].addr == addr && g_vconv[i].size == size && g_vconv[i].fmt == (uint32_t)f && g_vconv[i].off == off && g_vconv[i].stride == stride) gpu = g_vconv[i].gpu;
+        if (!gpu && addr)   // a range kept from an earlier submission whose source pages are unchanged
+            for (int i = 0; i < VKEEP && !gpu; i++) if (g_vkeep[i].gpu && g_vkeep[i].addr == addr && g_vkeep[i].size == size && g_vkeep[i].fmt == (uint32_t)f && g_vkeep[i].off == off && g_vkeep[i].stride == stride) {
+                if (!nvn_dirty_since_span(g_vkeep[i].span, (const void *)(uintptr_t)addr, (size_t)size, g_vkeep[i].stamp)) { gpu = g_vkeep[i].gpu; g_vkeep_hit++; }
+                else g_vkeep[i].gpu = 0;
+            }
         if (!gpu && addr) {
             uint64_t es = (uint64_t)vconv_size(f), nv = stride == 0 ? 1 : size >= off + es ? (size - off - es) / stride + 1 : 0;
             if (nv && nv * 16 <= (4u << 20)) {
-                id<MTLBuffer> b; size_t o = arena_alloc((size_t)nv * 16, &b); float *d = (float *)((uint8_t *)b.contents + o);
+                const void *span = nvn_dirty_span((const void *)(uintptr_t)addr, (size_t)size);
+                uint64_t stamp = 0; int k = -1; id<MTLBuffer> b; size_t o;
+                if (span) {   // tracked: stamp and protect before reading, so a write during the conversion counts as a change
+                    stamp = nvn_dirty_now(); nvn_dirty_protect((const void *)(uintptr_t)addr, (size_t)size);
+                    k = g_vkeep_next++ % VKEEP;
+                    if (g_vkeep_buf[k]) defer_obj_release(g_vkeep_buf[k]);
+                    b = g_vkeep_buf[k] = [g_dev newBufferWithLength:(NSUInteger)(nv * 16) options:MTLResourceStorageModeShared]; res_add(b); o = 0; g_vkeep_miss++;
+                } else o = arena_alloc((size_t)nv * 16, &b);
+                { static int dbg = -1, n; if (dbg < 0) dbg = getenv("DM_VCONV_LOG") != NULL; if (dbg && n++ < 60) MLOG("vconv: addr %#llx size %llu stride %u off %u fmt %#x nv %llu tracked %d", (unsigned long long)addr, (unsigned long long)size, stride, off, f, (unsigned long long)nv, span != NULL); }
+                float *d = (float *)((uint8_t *)b.contents + o);
                 for (uint64_t i = 0; i < nv; i++) vconv_elem(f, (const uint8_t *)(uintptr_t)(addr + off + i * stride), d + 4 * i);
                 gpu = b.gpuAddress + o;
+                if (k >= 0) { g_vkeep[k].addr = addr; g_vkeep[k].size = size; g_vkeep[k].fmt = (uint32_t)f; g_vkeep[k].off = off; g_vkeep[k].stride = stride; g_vkeep[k].span = span; g_vkeep[k].stamp = stamp; g_vkeep[k].gpu = gpu; }
                 int c = g_vconv_next++ % 64; g_vconv[c].addr = addr; g_vconv[c].size = size; g_vconv[c].serial = g_sub_serial; g_vconv[c].fmt = (uint32_t)f; g_vconv[c].off = off; g_vconv[c].stride = stride; g_vconv[c].gpu = gpu;
                 int ib, is;
                 if (vconv_i2f(f, &ib, &is)) { static int once; if (!once++) MLOG("vertex attribute format %#x (integers read as floats, which Metal has no vertex format for): converted on the CPU at replay and bound separately", f); }
@@ -3135,7 +3179,7 @@ static void vconv_bind(id<MTL4RenderCommandEncoder> en, const nvn_refl *rf) {
                 else RED_ONCE(96, "vertex attribute format %#x (8 / 16-bit integer) feeds an integer input of the opposite signedness: extended to 32 bits with the format's own signedness on the CPU at replay and bound separately", f);
             } else if (nv) RED_ONCE(90, "vertex attribute conversion: a range of %llu vertices exceeds the per-frame staging (format %#x)", (unsigned long long)nv, f);
         }
-        if (gpu) enc_r_vbuf(en, (NSUInteger)slot, gpu);
+        if (gpu) enc_r_vbuf(en, (NSUInteger)slot, gpu - skip * 16);   // converted elements are 16 bytes; element i of the draw sits at skip + i
         slot++;
     }
 }
@@ -5686,7 +5730,7 @@ frz_plain:;
     static id<MTLBuffer> zero; if (!zero) { zero = [g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared]; res_add(zero); }
     static uint64_t zero_gpu; if (!zero_gpu) zero_gpu = zero.gpuAddress;
     enc_r_vbuf(en, 30, zero_gpu);
-    if (pr->sh[0]) vconv_bind(en, &pr->sh[0]->rf);   // integer inputs fed float-type formats or 8 / 16-bit integers of the other sign (see vconv_ncomp, vconv_int)
+    if (pr->sh[0]) vconv_bind(en, &pr->sh[0]->rf, dw, di);   // integer inputs fed float-type formats or 8 / 16-bit integers of the other sign (see vconv_ncomp, vconv_int)
     g_kd_force = kd_draw(pr, dw, di);
     if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
     if (pr->sh[1]) encode_args(en, pr->sh[1], 1, 0);
@@ -6651,6 +6695,7 @@ void mtl_exec(const uint8_t *p) {
 #endif
                     g_vis_on = 1; g_vis_counting = 1; vis_clear(); }
                 break; }
+            case OP_FENCE_SYNC: { uint64_t v; memcpy(&v, a, 8); void nvn_fence_pending(void *); nvn_fence_pending((void *)v); break; }
             case OP_CLEAR_BUF: { const p_clear_buf *cb = a; mtl_sub_fill(cb->addr, cb->size, cb->value); break; }
             case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
                 PD("Y copy_b2b cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)s_, (unsigned long long)d, (unsigned long long)n); mtl_sub_copy(s_, d, n); break; }

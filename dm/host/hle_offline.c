@@ -1,3 +1,4 @@
+#include <unistd.h>
 // Networking and peripheral system services (out of scope: online play, local wireless, friends, telemetry, SSL) as seen through newer SDKs: all made "unavailable", the game takes its offline branch.
 // Only entry points that go to a service are hooked; library functions that only read and write the game's own buffers (prepo Add / Array / Struct, err ErrorResultVariant, friends getters, socket byte-order conversion) keep running in the SDK.
 // Return convention as in hle_friends.c: Result returns RES_FAIL ("saved / submitted" kinds return RES_OK so the game does not retry); bool returns false; events get a bound SystemEvent that never fires.
@@ -52,7 +53,10 @@ HLE_FORCE("_ZN2nn6socket12GetLastErrnoEv", "offline: ENETDOWN", int, h_sk_Errno,
 HLE_FORCE("_ZN2nn6socket6SocketEiii", "offline (cut): -1", int, h_sk_Socket3i, int a, int b, int c) { (void)a; (void)b; (void)c; return -1; }
 HLE_FORCE("_ZN2nn6socket8ShutdownEii", "offline (cut)", int, h_sk_Shutdown, int s, int h) { (void)s; (void)h; return -1; }
 HLE_FORCE("_ZN2nn6socket4BindEiPK8sockaddrj", "offline (cut)", int, h_sk_Bind, int s, const void *a, unsigned n) { (void)s; (void)a; (void)n; return -1; }
-HLE_FORCE("_ZN2nn6socket4PollEP6pollfdmi", "offline (cut)", int, h_sk_Poll, void *p, uint64_t n, int t) { (void)p; (void)n; (void)t; return -1; }
+// Offline poll: no descriptor ever becomes ready. Returning -1 at once made Dark Souls Remastered's network thread (Pia / NEX) spin a whole core on poll(timeout 0) forever,
+// 3.5 billion calls in 3 minutes on the same core as the menu's workers. The host now waits for the timeout as a real poll would (at most 50 ms, at least 1 ms for timeout 0) and reports no events.
+HLE_FORCE("_ZN2nn6socket4PollEP6pollfdmi", "offline: no descriptor becomes ready; waits for the timeout like poll(2)", int, h_sk_Poll, void *p, uint64_t n, int t) {
+    (void)p; (void)n; usleep(t < 0 || t > 50 ? 50000 : t == 0 ? 1000 : (useconds_t)t * 1000); return 0; }
 HLE_FORCE("_ZN2nn6socket6SendToEiPKvmiPK8sockaddrj", "offline (cut)", long, h_sk_SendTo, int s, const void *b, unsigned long n, int f, const void *a, unsigned al) { (void)s; (void)b; (void)n; (void)f; (void)a; (void)al; return -1; }
 HLE_FORCE("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", "offline (cut)", long, h_sk_SendTo2, int s, const void *b, unsigned long n, int f, const void *a, unsigned al) { (void)s; (void)b; (void)n; (void)f; (void)a; (void)al; return -1; }
 HLE_FORCE("_ZN2nn6socket8RecvFromEiPvmiP8sockaddrPj", "offline (cut)", long, h_sk_RecvFrom2, int s, void *b, unsigned long n, int f, void *a, unsigned *al) { (void)s; (void)b; (void)n; (void)f; (void)a; (void)al; return -1; }
