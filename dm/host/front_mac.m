@@ -59,6 +59,7 @@ void front_run(void (*guest)(void)) {
     if (!getenv("DM_WINDOW")) { guest(); return; }
     @autoreleasepool {
         [NSApplication sharedApplication];
+        { void front_gamepad_start(void); front_gamepad_start(); }   // game controllers (front_gamepad.m)
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         NSRect r = NSMakeRect(0, 0, 1280, 720);
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
