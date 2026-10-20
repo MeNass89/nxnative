@@ -453,6 +453,9 @@ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11De
     self[1] = d;
     LOG("[movie] decoder %p: type %d output %d mode %d priority %d", (void *)self, type, fmt, mode, prio);
 }
+// SDK 4 (Dark Souls Remastered) exports only the constructor without the thread priority; the same host object, priority 0
+HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE", "movie decoder (SDK 4, no priority argument): host implementation",
+          void, h_movie_Decoder4, void **self, int type, int fmt, int mode) { h_movie_Decoder(self, type, fmt, mode, 0); }
 static void md_free(void **self) {
     mdec_t *d = md_of(self); if (!d) return;
     md_defer_drop(d);
@@ -626,7 +629,7 @@ HLE_FORCE("_ZN5movie7Decoder19GetOutputBufferSizeEPiS1_", "movie decoder: output
 int nvn_host_write_texture(const void *nvntex, const void *src, int w, int h, size_t row, int *tw, int *th);
 int nvn_host_signal_sync(void *nvnsync);
 static int md_out_tex(mdec_t *d, int i, void *buf) {
-    if (!G.nvn_sync) G.nvn_sync = msym("_ZNK5movie6Buffer10GetNvnSyncEv");
+    static int nosync; if (!G.nvn_sync && !nosync) { G.nvn_sync = guest_sym("_ZNK5movie6Buffer10GetNvnSyncEv"); if (!G.nvn_sync) { nosync = 1; LOG("[RED] movie: SDK without Buffer::GetNvnSync (SDK 4, Dark Souls Remastered): no sync is signalled after a native-texture frame"); } }
     uint8_t *p = G.data(buf); size_t cap = G.cap(buf);
     if (!p || cap < 8) { LOG("[RED] movie: client buffer in native-texture mode is %zu bytes, needs 8 (a texture object)", cap); return 0x100b; }
     void *tex = p; int tw = 0, th = 0, f = nvn_host_write_texture(tex, NULL, 0, 0, 0, &tw, &th);
@@ -639,7 +642,7 @@ static int md_out_tex(mdec_t *d, int i, void *buf) {
         for (size_t j = 0; j < n; j++) k[j] = 0xff000000u;
         nvn_host_write_texture(tex, k, tw, th, (size_t)tw * 4, NULL, NULL); free(k);
     }
-    void *sy = G.nvn_sync(buf); if (sy && nvn_host_signal_sync(sy) && !d->red_dec++) LOG("[RED] movie: the buffer's sync object %p is not an NVNsync", sy);
+    void *sy = G.nvn_sync ? G.nvn_sync(buf) : NULL; if (sy && nvn_host_signal_sync(sy) && !d->red_dec++) LOG("[RED] movie: the buffer's sync object %p is not an NVNsync", sy);
     MD_TRACE(d, 12, "GetOutputBuffer index %d → texture %p (%d×%d format %#x)%s", i, tex, tw, th, f, d->out[i].pic ? "" : " (black frame)");
     return 0;
 }
