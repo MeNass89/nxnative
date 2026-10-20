@@ -46,6 +46,8 @@ static void on_key(NSEvent *e, int down) {
     int b = key_bit(c);
     if (b >= 0) g_btn = down ? (g_btn | 1ull << b) : (g_btn & ~(1ull << b));
     push();
+    // DM_KEYLOG=1: one line per key press / release with the presented frame number, to turn a played route into a DM_KEYS script
+    { static int on = -1; if (on < 0) on = getenv("DM_KEYLOG") != NULL; if (on) { uint64_t dm_guest_frame(void); LOG("KEYLOG f%llu %s key %u", (unsigned long long)dm_guest_frame(), down ? "down" : "up", c); } }
 }
 
 typedef struct { void (*fn)(void); } guest_arg;
@@ -71,6 +73,7 @@ void front_run(void (*guest)(void)) {
         g_layer = [CAMetalLayer layer];
         g_layer.device = MTLCreateSystemDefaultDevice();
         g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        g_layer.opaque = !getenv("DM_LAYER_TRANSLUCENT");   // The game leaves alpha < 1 in parts of its swapchain (Dark Souls: screen edges); a non-opaque layer let the white window background show through as flickering bars
         g_layer.contentsScale = win.backingScaleFactor;
         v.layer = g_layer;
         [win center];

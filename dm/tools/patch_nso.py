@@ -9,6 +9,7 @@
 #   Registered observation gates (OBS, restricted by build ID): one instruction at the entry is replaced with "enter the host observation callback → execute the original instruction → jump back", so diagnostics modify zero code at runtime; listed in <name>.obs.tsv
 # The key page only stores "actual key number × 8" at the end of the data segment, and patch code fetches thread slots indirectly through the key page: the loader may use any key number.
 # Output: <name>.patched.bin (key page and patch area appended after the image at PATCH_OFF; when that would start beyond 112 MB the patch area sits before the base, see FAR), <name>.fixups.tsv (layout and key page index header), <name>.gates.tsv, <name>.sites.tsv, <name>.cuts.tsv, <name>.obs.tsv
+import os
 import struct, re, sys, os
 from itertools import combinations
 import lz4.block
@@ -51,6 +52,14 @@ else:
 # Networking cuts (excluded scope: Battle.net / online play): taken from a community offline fix (LFS Mod Offline Fix for v2228224, which differs from the official 94012 main in only these 7 words).
 # Measured: the system service layer (nifm offline / DNS black hole / account service) cannot get around it: the game itself sends Battle.net requests directly and allows offline play according to the "last online" time.
 CUTS = {
+  # DARK SOULS: REMASTERED 1.0.3 (v196608) main: 60 fps (masagrator's FPSLocker-Warehouse config and ChanseyIsTheBest's cheat for this build, DF3766A2BB651A3E).
+  # main+0x706fa4 hands the frame limiter its target (mov w1,#30 → #60); main+0x667904 loads the game's time step per frame from rodata (1/30 at +0x167a6ec → 1/60 at +0x167a834,
+  # a constant already in the image), so the world advances at normal speed at 60. Known on the Switch: ladders climb oddly at 60 (the mod advises 30 for them); cutscenes drop to 30.
+  # Off unless the rewrite runs with DM_DSR_FPS=60: the 30 fps game is the verified one.
+  'df3766a2bb651a3e822828abf10b6f7b': [
+    (0x706fa4, 'e10f1f32', 'e10f1e32', 'frame limiter target mov w1,#30 → mov w1,#60', 'host-only'),
+    (0x667904, '08ed46bd', '083548bd', 'per-frame time step ldr s8,[x8,#0x6ec] (1/30) → ldr s8,[x8,#0x834] (1/60)', 'host-only'),
+  ] if os.environ.get('DM_DSR_FPS') == '60' else [],
   # Super Mario Bros. Wonder v0 main
   'cd6e42aee7934f4d8393cd43893ae25e': [
     # Resource heap slack: each resource unit's ExpHeap is created with the resource size table value + 0x1008 (main+0x1e603c → ExpHeap::create main+0x4aac38); the table holds Nintendo's measured peaks with almost no margin
@@ -301,6 +310,26 @@ if RULE_RUN and PRIVATE_GATES:
             target = 0x369900 if off == 0x369a90 else 0x6dce50
             new = 0x14000000 | (((target - off) >> 2) & 0x3ffffff)
         cuts.append((off, struct.pack('<I', old).hex(), struct.pack('<I', new).hex(), 'touch-run-v4: ' + why))
+# Atmosphere cheats for testing (DM_CHEATS=<cheat .txt>:<name>[,<name>...], main only): the dmnt type-0 lines "04000000 <offset> <u32>" write a word
+# into main's code at a fixed offset, which is what a cut does, so they are applied at rewrite time. Other cheat types (memory regions, conditions, loops) need the
+# dmnt virtual machine at run time and are refused here. Each word's original bytes are read from this image, so a cheat for another build is caught by nothing but
+# its build ID: the file name of an Atmosphere cheat is the build ID it was written for, and it must match this module.
+if os.environ.get('DM_CHEATS') and NAME == 'main':
+    path, _, want = os.environ['DM_CHEATS'].partition(':')
+    bid = os.path.splitext(os.path.basename(path))[0].lower()
+    assert BUILD_ID.startswith(bid), f'cheat file {path} is for build {bid}, this main is {BUILD_ID}'
+    names = {n.strip().lower() for n in want.split(',') if n.strip()}; cur = None; got = set()
+    for line in open(path, encoding='utf-8', errors='replace'):
+        line = line.strip()
+        if line.startswith('[') and line.endswith(']'): cur = line[1:-1].strip(); continue
+        if not line or cur is None or (names and cur.lower() not in names): continue
+        w = line.split()
+        assert len(w) == 3 and w[0] == '04000000', f'cheat [{cur}]: only type-0 main writes are supported, got {line!r}'
+        off, val = int(w[1], 16), int(w[2], 16)
+        cuts.append((off, bytes(IMG[off:off + 4]).hex(), struct.pack('<I', val).hex(), f'cheat [{cur}]', 'host-only')); got.add(cur.lower())
+    missing = names - got
+    assert not missing, f'cheats not found in {path}: {sorted(missing)}'
+    print(f'cheats applied: {sorted(got)}', file=sys.stderr)
 cuts = [c if len(c) == 5 else (*c, 'all') for c in cuts]          # 5th item is the scope: all | host-only (host-only = not applied by the ground-truth emulator)
 for off, ob, nb, why, scope in cuts:
     ob, nb = bytes.fromhex(ob), bytes.fromhex(nb)
