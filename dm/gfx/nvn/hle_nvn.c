@@ -208,13 +208,21 @@ static int dpool_add(struct dpool_base *t, int *nt, int *next, const void *pool,
 }
 static int dpool_base(const struct dpool_base *t, int nt, const void *pool) { for (int i = 0; i < nt; i++) if (t[i].pool == pool) return t[i].base; return 0; }
 // The pools each command buffer last bound, as bases (only command buffers that bound a pool other than the first one of its kind are listed)
-static struct { const void *cmd; int tb, sb; } g_cbpool[64]; static int g_ncbpool;
+#define NCBPOOL 256
+static struct { const void *cmd; int tb, sb; } g_cbpool[NCBPOOL]; static int g_ncbpool;
+// A command buffer's slot is released when it is finalized or initialized again: Dark Souls Remastered builds new command buffers all the time, and with dead
+// ones never released the 64 slots filled in the first minute (132,000 RED lines and later buffers read with the first pool's numbering)
+static void cb_pool_drop(const void *c) {
+    pthread_mutex_lock(&g_dpool_mu);
+    for (int i = 0; i < g_ncbpool; i++) if (g_cbpool[i].cmd == c) { g_cbpool[i] = g_cbpool[--g_ncbpool]; break; }
+    pthread_mutex_unlock(&g_dpool_mu);
+}
 static void cb_pool_set(const void *c, int tex, int base) {
     pthread_mutex_lock(&g_dpool_mu);
     int i = 0; while (i < g_ncbpool && g_cbpool[i].cmd != c) i++;
-    if (i == g_ncbpool && base && g_ncbpool < 64) g_cbpool[g_ncbpool++] = (typeof(g_cbpool[0])){c, 0, 0};
+    if (i == g_ncbpool && base && g_ncbpool < NCBPOOL) g_cbpool[g_ncbpool++] = (typeof(g_cbpool[0])){c, 0, 0};
     if (i < g_ncbpool) { if (tex) g_cbpool[i].tb = base; else g_cbpool[i].sb = base; }
-    else if (base) LOG("[RED] more than 64 command buffers bound a non-first descriptor pool: the extra ones count as the first pool");
+    else if (base) { static int once_; if (!once_++) LOG("[RED] more than %d live command buffers bound a non-first descriptor pool: the extra ones count as the first pool", NCBPOOL); }
     pthread_mutex_unlock(&g_dpool_mu);
 }
 NVN(nvnTexturePoolInitialize, NVNboolean, NVNtexturePool *tp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
@@ -578,9 +586,10 @@ NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; mtl_finish(); }
 #define OP_RESERVE 24                             // Always keep enough room at the segment end for one JUMP / END
 
 NVN(nvnCommandBufferInitialize, NVNboolean, NVNcommandBuffer *c, NVNdevice *d) {
+    if (g_ncbpool) cb_pool_drop(c);
     memset(c, 0, sizeof(cmd_t)); CB(c)->magic = MAGIC('C', 'M', 'D', 'B'); CB(c)->dev = d; return 1;
 }
-NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { CB(c)->magic = 0; }
+NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { CB(c)->magic = 0; if (g_ncbpool) cb_pool_drop(c); }
 NVN(nvnCommandBufferSetMemoryCallback, void, NVNcommandBuffer *c, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb) { CB(c)->cb = cb; }
 NVN(nvnCommandBufferSetMemoryCallbackData, void, NVNcommandBuffer *c, void *d) { CB(c)->cb_data = d; }
 static uint8_t *align8(uint8_t *p) { return (uint8_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7); }
@@ -1985,6 +1994,17 @@ static void write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r
     if (!bpb) { ONCE_LOG("[RED] WriteTexels: unknown format %#x", t->d.format); return; }
     unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
     int is3d = t->d.target == NVN_TEXTURE_TARGET_3D, nz = r->depth ? r->depth : 1;
+    // A linear texture (NVN_TEXTURE_FLAGS_LINEAR, row pitch = the builder's stride): rows go in as they are. Dark Souls Remastered's movie player decodes into a linear
+    // 1920x1080 RGBA8 texture (stride 7680); swizzling it as block linear scattered the frames into tiles and green bands
+    if ((t->d.flags & NVN_TEXTURE_FLAGS_LINEAR) && t->d.stride && !is3d && level == 0 && layer0 == 0 && r->zoffset == 0 && nz == 1) {
+        size_t wb = (size_t)((r->width + bw - 1) / bw) * bpb, hb = (size_t)(r->height + bh - 1) / bh, rr = row ? row : wb;
+        size_t x0 = (size_t)(r->xoffset / bw) * bpb, y0 = (size_t)(r->yoffset / bh);
+        if (x0 + wb <= t->d.stride && (y0 + hb) * t->d.stride <= t->L.size) {
+            dm_guest_write_prepare(t->mem, t->L.size);
+            for (size_t y = 0; y < hb; y++) memcpy(t->mem + (y0 + y) * t->d.stride + x0, src + y * rr, wb);
+            mtl_tex_cpu_written(t); return;
+        }
+    }
     if (!is3d) {
         size_t wb0 = (size_t)((r->width + bw - 1) / bw) * bpb, row0 = row ? row : wb0, img0 = img ? img : row0 * (size_t)((r->height + bh - 1) / bh);
         dm_guest_write_prepare(t->mem, t->L.size);
