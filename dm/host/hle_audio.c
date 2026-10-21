@@ -127,6 +127,8 @@ static OSStatus au_render(void *ctx, AudioUnitRenderActionFlags *f, const AudioT
     pull(a, bl->mBuffers[0].mData, bl->mBuffers[0].mDataByteSize);
     { static int mute = -1; if (mute < 0) { const char *e = getenv("DM_AUDIO_MUTE"); mute = e && atoi(e); }   // diagnostic: the whole real-output path (AudioUnit callback pacing, background take-over) but with the output silenced (lifecycle tests on the Mac without noise)
       if (mute) memset(bl->mBuffers[0].mData, 0, bl->mBuffers[0].mDataByteSize); }
+    { static int vol = -1; if (vol < 0) { const char *e = getenv("DM_VOLUME"); vol = e ? atoi(e) : 100; if (vol < 0) vol = 0; if (vol > 100) vol = 100; }   // master volume in percent (the player's launcher setting; 100 = untouched)
+      if (vol < 100) { int16_t *s = bl->mBuffers[0].mData; for (UInt32 i = 0, n = bl->mBuffers[0].mDataByteSize / 2; i < n; i++) s[i] = (int16_t)(s[i] * vol / 100); } }
     return noErr;
 }
 static OSStatus au_create(aout *a) {

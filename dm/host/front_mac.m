@@ -79,8 +79,16 @@ void front_run(void (*guest)(void)) {
         [win center];
         [win makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
+        win.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+        { const char *fs = getenv("DM_FULLSCREEN"); if (fs && atoi(fs)) [win toggleFullScreen:nil]; }   // start in fullscreen (the player's launcher setting)
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
+            // The window has no menu bar: Command-F / Control-Command-F toggles fullscreen, Command-Q quits
+            if (e.type == NSEventTypeKeyDown && (e.modifierFlags & NSEventModifierFlagCommand)) {
+                NSString *c = e.charactersIgnoringModifiers.lowercaseString;
+                if ([c isEqualToString:@"f"]) { [win toggleFullScreen:nil]; return nil; }
+                if ([c isEqualToString:@"q"]) { [win performClose:nil]; return nil; }
+            }
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
             return nil;   // Swallow it to avoid the system beep
         }];
