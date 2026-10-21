@@ -64,7 +64,7 @@ CUTS = {
     (0x706fa4, 'e10f1f32', '010f8052', 'frame limiter target mov w1,#30 → movz w1,#120', 'host-only'),
     (0x667904, '08ed46bd', '08a967bd', 'per-frame time step ldr s8,[x8,#0x6ec] (1/30) → ldr s8,[x8,#0x27a8] (1/120)', 'host-only'),
   ] if os.environ.get('DM_DSR_FPS') == '120' else []) + ([
-    # DM_DSR_RES=2160: the six places that size the game's 1920x1080 targets (scene, post-process, swap chain; orr w1,wzr,#0x780 / mov w2,#0x438 before each create call)
+    # DM_DSR_RES=2160: the six places that size the game's 1920x1080 targets, and the four that scale its 1280x720 base by 1.5 for the TV (fmov #1.5 before the create calls; the main MSAA scene targets), (scene, post-process, swap chain; orr w1,wzr,#0x780 / mov w2,#0x438 before each create call)
     # ask for 3840x2160 instead (movz: 0x870 is not a logical immediate)
     (0x70558c, 'e10f1932', '01e08152', 'width w1 #0x780 → movz #0xf00', 'host-only'),
     (0x705588, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
@@ -78,6 +78,12 @@ CUTS = {
     (0x9c95cc, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
     (0x9c9bd0, 'e10f1932', '01e08152', 'width w1 #0x780 → movz #0xf00', 'host-only'),
     (0x9c9bc8, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
+    (0xe7678, '02106f1e', '0210611e', 'docked scale of the base resolution fmov d2,#1.5 → #3.0 (1280x720 → 3840x2160)', 'host-only'),
+    (0xfba7c, '01106f1e', '0110611e', 'docked scale of the base resolution fmov d1,#1.5 → #3.0 (1280x720 → 3840x2160)', 'host-only'),
+    (0xfbd24, '01106f1e', '0110611e', 'docked scale of the base resolution fmov d1,#1.5 → #3.0 (1280x720 → 3840x2160)', 'host-only'),
+    (0x89ad20, '02106f1e', '0210611e', 'docked scale of the base resolution fmov d2,#1.5 → #3.0 (1280x720 → 3840x2160)', 'host-only'),
+    # the 1.63 GB allocator partition carved from the main heap at start (mov w19,#0x68000000) runs out with 4K targets: 3.63 GB, with the host's DM_APP_POOL raised to match
+    (0x66f4c8, '1300ad52', '1300bd52', 'main allocator partition mov w19,#0x68000000 → #0xe8000000', 'host-only'),
   ] if os.environ.get('DM_DSR_RES') == '2160' else []),
   # Super Mario Bros. Wonder v0 main
   'cd6e42aee7934f4d8393cd43893ae25e': [

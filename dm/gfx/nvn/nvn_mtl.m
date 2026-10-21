@@ -5803,12 +5803,18 @@ frz_plain:;
     if (g_ui_rect_fn && dw && dw->count == 4 && S.nattr == 2 && S.stream[0].stride == 20) { double uy = 0, uh = 1; g_ui_rect_fn(&uy, &uh);
         if (uh > 0 && uh < 1) { if (ui_cover_all(uh)) vs = 1 / uh; else if (uy > 0) { so = lround(uy * th); if (ui_mat_ok()) moff = 2 * uy; else { vo = so; static int n; if (n++ < 4) MLOG("UI shift down: the projection matrix could not be read this time; moving the viewport instead (pass %llu)", g_stat_pass); } } } }
     if (moff != g_ui_moff) { g_ui_moff = moff; g_args_dirty[0] = 1; }
-    { MTLViewport v = S.has_vp ? (MTLViewport){S.vp[0][0], S.vp[0][1] + vo, S.vp[0][2], S.vp[0][3] * vs, S.dr[0], S.dr[1]} : (MTLViewport){0, vo, tw, th * vs, 0, 1};
+    // Experiment DM_VP_UP=WxH: a pass whose target is exactly 2x WxH gets the game's viewport and scissor doubled when they fit in WxH (a game built for WxH rendering into enlarged targets)
+    static int upw = -1, uph; if (upw < 0) { const char *e = getenv("DM_VP_UP"); if (!e || sscanf(e, "%dx%d", &upw, &uph) != 2) upw = 0; }
+    // the target is one of the doubled chain (2W x 2H, W x H, W/2 x H/2, W/4 x H/4) and the game's viewport covers exactly its top-left half: the game sized the viewport for the old target
+    int chain = 0; for (int k = 0; k < 4 && upw; k++) if (tw == (2u * (unsigned)upw) >> k && th == (2u * (unsigned)uph) >> k) chain = 1;
+    double up = chain && S.has_vp && S.vp[0][0] == 0 && S.vp[0][1] == 0 && fabs(S.vp[0][2] * 2 - tw) < 1 && fabs(S.vp[0][3] * 2 - th) < 1 ? 2 : 1;
+    { MTLViewport v = S.has_vp ? (MTLViewport){S.vp[0][0] * up, (S.vp[0][1] + vo) * up, S.vp[0][2] * up, S.vp[0][3] * vs * up, S.dr[0], S.dr[1]} : (MTLViewport){0, vo, tw, th * vs, 0, 1};
       if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { v.originY += v.height; v.height = -v.height; }   // lower-left origin (see g_origin_ll)
       if (!(g_ed.ok & ED_VP) || memcmp(&g_ed.vp, &v, sizeof v)) { enc_r_viewport(en, v); g_ed.vp = v; g_ed.ok |= ED_VP; } }
     MTLScissorRect sc = {0, 0, tw, th};
     if (R.has_sc) {
         long x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y <= 0 ? 0 : R.sc.y + so, x1 = (long)R.sc.x + R.sc.w, y1 = vs != 1 ? (long)th : (long)R.sc.y + R.sc.h + so;
+        if (up != 1 && 2 * x1 <= (long)tw && 2 * y1 <= (long)th) { x0 *= 2; y0 *= 2; x1 *= 2; y1 *= 2; }
         if (x1 > (long)tw) x1 = tw; if (y1 > (long)th) y1 = th;
         if (x1 <= x0 || y1 <= y0) { PD("Z %llu draw skipped: empty scissor (%d,%d %dx%d, target %lux%lu)", g_stat_pass, R.sc.x, R.sc.y, R.sc.w, R.sc.h, (unsigned long)tw, (unsigned long)th); return; }
         sc = (MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)};
