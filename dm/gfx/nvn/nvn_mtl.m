@@ -7426,9 +7426,11 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         CFTimeInterval tt = d.presentedTime;
         g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};
     }];
-    // Each frame is displayed for at least one present period: when the GPU completion time jitters around a 120 Hz refresh boundary, the paired "25 ms + 8.33 ms" stutter no longer appears
+    // Each frame is displayed for at least one present period: when the GPU completion time jitters around a 120 Hz refresh boundary, the paired "25 ms + 8.33 ms" stutter no longer appears.
+    // Only for periods of 60 fps or longer: a shorter one need not be whole vsyncs (90 fps on a fixed 120 Hz display), where the minimum rounds every frame up to 2 vsyncs (60 fps);
+    // the game's own frame limiter paces those rates
     if (target_ts > 0) [dr present];
-    else if (period > 0) [dr presentAfterMinimumDuration:period]; else [dr present];
+    else if (period > 1.0 / 61) [dr presentAfterMinimumDuration:period]; else [dr present];
 #endif
     (void)frame;
     return 1;
