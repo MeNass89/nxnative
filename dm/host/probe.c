@@ -69,7 +69,7 @@ static int probe_hit(ucontext_t *uc) {   // Registered by probe_install with the
     uint64_t pc = uc->uc_mcontext->__ss.__pc;
     for (int i = 0; i < g_nprobe; i++) if (g_probe[i].at == pc) {
         probe_dump_once();
-        if (g_probe[i].fn) { g_probe[i].hits++; g_probe[i].fn(uc); uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot; return 1; }
+        if (g_probe[i].fn) { g_probe[i].hits++; uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot; g_probe[i].fn(uc); return 1; }   // pc points at the slot before the handler runs, so a handler may redirect it
         if (g_probe[i].freg >= 0) {   // ?xN=value / ?[xN+offset]=value: pass through silently when it does not match
             uint64_t v = uc->uc_mcontext->__ss.__x[g_probe[i].freg]; vm_size_t g = 0;
             if (g_probe[i].foff >= 0 && vm_read_overwrite(mach_task_self(), v + g_probe[i].foff, 8, (vm_address_t)&v, &g)) v = ~g_probe[i].fval;
@@ -122,6 +122,11 @@ static void probe_add(module_t *m, uint64_t off, long dump, probe_fn fn) {
     g_nprobe++;
 }
 
+// Built-in handler probes for host features (hle_dsrwarp.c): registered from probe_install before the slots are sealed
+void probe_add_fn(const char *mod, uint64_t off, probe_fn fn) {
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, mod)) { probe_add(&g_mod[i], off, -1, fn); return; }
+    LOG("[RED] probe_add_fn: no module %s", mod);
+}
 #endif
 
 void probe_install(void) {
@@ -157,6 +162,7 @@ void probe_install(void) {
             }
         }
     }
+    { void dsr_warp_install(void); dsr_warp_install(); }   // DM_WARP bonfire warp (Dark Souls Remastered)
     if (g_slots && !g_slots_sealed) { mprotect(g_slots, 0x4000, PROT_READ | PROT_EXEC); sys_icache_invalidate(g_slots, 0x4000); g_slots_sealed = 1; }
 #endif
 }
