@@ -6291,6 +6291,12 @@ static void copy_t2t(const p_copy_t2t *c) {
         if (zskip_has(c->src->serial, sl, ss)) zskip_add(c->dst->serial, dl, ds);
     }
     id<MTLTexture> s = tex_mtl(c->src), d = tex_mtl(c->dst);
+    {   // DM_VP_UP (experimental 4K): a copy whose regions cover exactly the top-left half of both textures was sized for the old targets: copy the whole textures
+        static int upw = -1, uph; if (upw < 0) { const char *e = getenv("DM_VP_UP"); if (!e || sscanf(e, "%dx%d", &upw, &uph) != 2) upw = 0; }
+        if (upw && s && d && !c->sr.xoffset && !c->sr.yoffset && !c->dr.xoffset && !c->dr.yoffset && (NSUInteger)c->sr.width * 2 == s.width && (NSUInteger)c->sr.height * 2 == s.height
+            && (NSUInteger)c->dr.width * 2 == d.width && (NSUInteger)c->dr.height * 2 == d.height) {
+            p_copy_t2t *cc = (p_copy_t2t *)c; cc->sr.width *= 2; cc->sr.height *= 2; cc->dr.width *= 2; cc->dr.height *= 2; }
+    }
     PD("T src=%llu dst=%llu %dx%dx%d→%dx%dx%d flags=%#x", c->src->serial, c->dst->serial, c->sr.width, c->sr.height, c->sr.depth, c->dr.width, c->dr.height, c->dr.depth, c->flags);
     if (!s || !d) return;
     unsigned sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
