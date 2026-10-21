@@ -3118,9 +3118,13 @@ static int vconv_wanted(const nvn_refl *rf, int v, const pso_key *k) {   // does
 static struct { uint64_t addr, size, serial; uint32_t fmt, off, stride; uint64_t gpu; } g_vconv[64]; static int g_vconv_next;
 // Across submissions: a converted range is kept in a buffer of its own and reused while the guest pages it was read from stay unwritten (nvn_dirty_since).
 // Dark Souls Remastered converts its menu and character meshes every frame (16-bit integers into float inputs): 280 M instructions per frame on the submit thread, 9.4 ms of a 33 ms frame.
-// A refill always takes a new buffer (an earlier submission may still be reading the old one, which is released after it completes). Untracked memory is never kept.
-#define VKEEP 256
-static struct { uint64_t addr, size, stamp, gpu; uint32_t fmt, off, stride; const void *span; } g_vkeep[VKEEP]; static id<MTLBuffer> g_vkeep_buf[VKEEP]; static int g_vkeep_next;
+// A refill always takes a new buffer (an earlier submission may still be reading the old one, which is released after it completes) but keeps its slot. Untracked memory is never kept.
+// Found by a hash of the range, not a scan: Dark Souls Remastered converts about 360 ranges a frame at Firelink Shrine (its world meshes: 16-bit integers into integer inputs), more than
+// the 256 slots this cache first had, so every one was evicted before its next use - 340,000 vertices converted and 360 new buffers a frame, about 5 ms of the submit thread
+#define VKEEP 8192
+typedef struct { uint64_t addr, size; uint32_t fmt, off, stride, pad; } vkeep_key;
+static struct { vkeep_key k; uint64_t stamp, gpu; const void *span; } g_vkeep[VKEEP]; static id<MTLBuffer> g_vkeep_buf[VKEEP]; static int g_vkeep_next;
+static nvn_hmap g_vkeep_map = {.klen = sizeof(vkeep_key)};   // range -> slot + 1
 static uint64_t g_vkeep_hit, g_vkeep_miss;
 // The vertices a draw reads: [first, first + count) for a direct non-indexed draw; for a direct indexed draw the smallest and largest index (read from guest memory) plus the base vertex.
 // 0 = unknown (indirect, instanced streams): convert the whole bound range as before. Dark Souls Remastered binds a 2 MB ring of 175,000 vertices and draws a few dozen of them:
@@ -3152,11 +3156,11 @@ static void vconv_bind(id<MTL4RenderCommandEncoder> en, const nvn_refl *rf, cons
             if (lo < hi) { skip = lo; addr += lo * stride; size = (hi - lo - 1) * stride + off + es; }
         }
         for (int i = 0; i < 64 && !gpu; i++) if (g_vconv[i].serial == g_sub_serial && g_vconv[i].addr == addr && g_vconv[i].size == size && g_vconv[i].fmt == (uint32_t)f && g_vconv[i].off == off && g_vconv[i].stride == stride) gpu = g_vconv[i].gpu;
-        if (!gpu && addr)   // a range kept from an earlier submission whose source pages are unchanged
-            for (int i = 0; i < VKEEP && !gpu; i++) if (g_vkeep[i].gpu && g_vkeep[i].addr == addr && g_vkeep[i].size == size && g_vkeep[i].fmt == (uint32_t)f && g_vkeep[i].off == off && g_vkeep[i].stride == stride) {
-                if (!nvn_dirty_since_span(g_vkeep[i].span, (const void *)(uintptr_t)addr, (size_t)size, g_vkeep[i].stamp)) { gpu = g_vkeep[i].gpu; g_vkeep_hit++; }
-                else g_vkeep[i].gpu = 0;
-            }
+        vkeep_key vk = {addr, size, (uint32_t)f, off, stride, 0}; int ki = gpu || !addr ? -1 : (int)(intptr_t)nvn_hm_get(&g_vkeep_map, &vk) - 1;
+        if (ki >= 0 && g_vkeep[ki].gpu) {   // a range kept from an earlier submission whose source pages are unchanged
+            if (!nvn_dirty_since_span(g_vkeep[ki].span, (const void *)(uintptr_t)addr, (size_t)size, g_vkeep[ki].stamp)) { gpu = g_vkeep[ki].gpu; g_vkeep_hit++; }
+            else g_vkeep[ki].gpu = 0;
+        }
         if (!gpu && addr) {
             uint64_t es = (uint64_t)vconv_size(f), nv = stride == 0 ? 1 : size >= off + es ? (size - off - es) / stride + 1 : 0;
             if (nv && nv * 16 <= (4u << 20)) {
@@ -3164,15 +3168,16 @@ static void vconv_bind(id<MTL4RenderCommandEncoder> en, const nvn_refl *rf, cons
                 uint64_t stamp = 0; int k = -1; id<MTLBuffer> b; size_t o;
                 if (span) {   // tracked: stamp and protect before reading, so a write during the conversion counts as a change
                     stamp = nvn_dirty_now(); nvn_dirty_protect((const void *)(uintptr_t)addr, (size_t)size);
-                    k = g_vkeep_next++ % VKEEP;
+                    if ((k = ki) < 0) { k = g_vkeep_next++ % VKEEP; if (g_vkeep_buf[k]) nvn_hm_del(&g_vkeep_map, &g_vkeep[k].k); nvn_hm_put(&g_vkeep_map, &vk, (void *)(intptr_t)(k + 1)); }
                     if (g_vkeep_buf[k]) defer_obj_release(g_vkeep_buf[k]);
                     b = g_vkeep_buf[k] = [g_dev newBufferWithLength:(NSUInteger)(nv * 16) options:MTLResourceStorageModeShared]; res_add(b); o = 0; g_vkeep_miss++;
                 } else o = arena_alloc((size_t)nv * 16, &b);
-                { static int dbg = -1, n; if (dbg < 0) dbg = getenv("DM_VCONV_LOG") != NULL; if (dbg && n++ < 60) MLOG("vconv: addr %#llx size %llu stride %u off %u fmt %#x nv %llu tracked %d", (unsigned long long)addr, (unsigned long long)size, stride, off, f, (unsigned long long)nv, span != NULL); }
+                { static long dbg = -1, n; if (dbg < 0) dbg = getenv("DM_VCONV_LOG") ? atol(getenv("DM_VCONV_LOG")) : -2; if (dbg >= 0 && (uint64_t)dbg <= g_sub_serial && n < 4000) { n++; MLOG("vconv: addr %#llx size %llu stride %u off %u fmt %#x nv %llu tracked %d input %d ct %d span %d sub %llu", (unsigned long long)addr, (unsigned long long)size, stride, off, f, (unsigned long long)nv, span != NULL, rf->v[v].loc, rf->v[v].ct, have_span, (unsigned long long)g_sub_serial); } }
                 float *d = (float *)((uint8_t *)b.contents + o);
                 for (uint64_t i = 0; i < nv; i++) vconv_elem(f, (const uint8_t *)(uintptr_t)(addr + off + i * stride), d + 4 * i);
                 gpu = b.gpuAddress + o;
-                if (k >= 0) { g_vkeep[k].addr = addr; g_vkeep[k].size = size; g_vkeep[k].fmt = (uint32_t)f; g_vkeep[k].off = off; g_vkeep[k].stride = stride; g_vkeep[k].span = span; g_vkeep[k].stamp = stamp; g_vkeep[k].gpu = gpu; }
+                if (k >= 0) { g_vkeep[k].k = vk; g_vkeep[k].span = span; g_vkeep[k].stamp = stamp; g_vkeep[k].gpu = gpu; }
+                if (span && !(g_vkeep_miss & (g_vkeep_miss - 1)) && g_vkeep_miss >= 1024) MLOG("vertex conversion cache: %llu misses, %llu hits, %u ranges kept", (unsigned long long)g_vkeep_miss, (unsigned long long)g_vkeep_hit, g_vkeep_map.n);
                 int c = g_vconv_next++ % 64; g_vconv[c].addr = addr; g_vconv[c].size = size; g_vconv[c].serial = g_sub_serial; g_vconv[c].fmt = (uint32_t)f; g_vconv[c].off = off; g_vconv[c].stride = stride; g_vconv[c].gpu = gpu;
                 int ib, is;
                 if (vconv_i2f(f, &ib, &is)) { static int once; if (!once++) MLOG("vertex attribute format %#x (integers read as floats, which Metal has no vertex format for): converted on the CPU at replay and bound separately", f); }
