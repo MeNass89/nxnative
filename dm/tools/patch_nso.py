@@ -47,48 +47,43 @@ else:
     KEY_PAGE_OFF = (len(IMG) + 0x3FFF) & ~0x3FFF
     IMG.extend(bytes(0x4000))
     PATCH_OFF = (len(IMG) + 0xFFFF) & ~0xFFFF
+    # Dark Souls Remastered's frame step state page (DSR_STEP, the page after the key page) would start at PATCH_OFF: the patch area moves 64 KB further
+    if d[0x40:0x50].hex() == 'df3766a2bb651a3e822828abf10b6f7b' and os.environ.get('DM_DSR_FPS') in ('60', '90', '120') and PATCH_OFF < KEY_PAGE_OFF + 0x8000: PATCH_OFF += 0x10000
 
 # ---- Registered cuts: {NSO build ID: [(offset, original bytes, new bytes, reason)]} ----
 # Networking cuts (excluded scope: Battle.net / online play): taken from a community offline fix (LFS Mod Offline Fix for v2228224, which differs from the official 94012 main in only these 7 words).
 # Measured: the system service layer (nifm offline / DNS black hole / account service) cannot get around it: the game itself sends Battle.net requests directly and allows offline play according to the "last online" time.
+# Dark Souls Remastered internal resolution (DM_DSR_RES, CUTS below): movz w1 / w2 with the target width / height, and fmov #1.5 (imm8 0x78) → #2.0 (0x00) or #3.0 (0x08)
+_DSR_RES = {'1440': (2560, 1440, 0x00), '2160': (3840, 2160, 0x08)}.get(os.environ.get('DM_DSR_RES'))
+DSR_RES_W = struct.pack('<I', 0x52800001 | _DSR_RES[0] << 5).hex() if _DSR_RES else ''
+DSR_RES_H = struct.pack('<I', 0x52800002 | _DSR_RES[1] << 5).hex() if _DSR_RES else ''
+def dsr_fmov(w): v = struct.unpack('<I', bytes.fromhex(w))[0]; assert (v >> 13) & 0xff == 0x78, w; return struct.pack('<I', v & ~(0xff << 13) | _DSR_RES[2] << 13).hex()
 CUTS = {
   # DARK SOULS: REMASTERED 1.0.3 (v196608) main: 60 fps (masagrator's FPSLocker-Warehouse config and ChanseyIsTheBest's cheat for this build, DF3766A2BB651A3E).
-  # main+0x706fa4 hands the frame limiter its target (mov w1,#30 → #60); main+0x667904 loads the game's time step per frame from rodata (1/30 at +0x167a6ec → 1/60 at +0x167a834,
-  # a constant already in the image), so the world advances at normal speed at 60. Known on the Switch: ladders climb oddly at 60 (the mod advises 30 for them); cutscenes drop to 30.
-  # Off unless the rewrite runs with DM_DSR_FPS=60: the 30 fps game is the verified one. DM_DSR_FPS=120 the same way: target 120 and the time step 1/120 (+0x167c7a8, also in the image,
-  # in reach of the same load), for a 120 Hz display; the host presents at 120 only with DM_PRESENT_HZ=120.
+  # main+0x706fa4 hands the frame limiter its target (mov w1,#30); main+0x667904 loads the game's time step per frame from rodata (1/30 at +0x167a6ec; 1/60 at +0x167a834 and 1/120
+  # at +0x167c7a8 are also in the image). Known on the Switch: ladders climb oddly at 60 (the mod advises 30 for them); cutscenes drop to 30.
+  # Off unless the rewrite runs with DM_DSR_FPS=60, 90 or 120: the 30 fps game is the verified one. The limiter target becomes that rate; the time step load becomes a stub that reads
+  # the host's frame time (FRAME_STEP state page, DSR_STEP below), so the world advances at normal speed whatever rate the machine holds. The host presents at DM_PRESENT_HZ.
   'df3766a2bb651a3e822828abf10b6f7b': ([
-    (0x706fa4, 'e10f1f32', 'e10f1e32', 'frame limiter target mov w1,#30 → mov w1,#60', 'host-only'),
-    (0x667904, '08ed46bd', '083548bd', 'per-frame time step ldr s8,[x8,#0x6ec] (1/30) → ldr s8,[x8,#0x834] (1/60)', 'host-only'),
-  ] if os.environ.get('DM_DSR_FPS') == '60' else [
-    (0x706fa4, 'e10f1f32', '010f8052', 'frame limiter target mov w1,#30 → movz w1,#120', 'host-only'),
-    (0x667904, '08ed46bd', '08a967bd', 'per-frame time step ldr s8,[x8,#0x6ec] (1/30) → ldr s8,[x8,#0x27a8] (1/120)', 'host-only'),
-  ] if os.environ.get('DM_DSR_FPS') == '120' else []) + ([
-    # DM_DSR_RES=2160: the six places that size the game's 1920x1080 targets, and the four that scale its 1280x720 base by 1.5 for the TV (fmov #1.5 before the create calls; the main MSAA scene targets), (scene, post-process, swap chain; orr w1,wzr,#0x780 / mov w2,#0x438 before each create call)
-    # ask for 3840x2160 instead (movz: 0x870 is not a logical immediate)
-    (0x70558c, 'e10f1932', '01e08152', 'width w1 #0x780 → movz #0xf00', 'host-only'),
-    (0x705588, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
-    (0x705624, 'e10f1932', '01e08152', 'width w1 #0x780 → movz #0xf00', 'host-only'),
-    (0x705620, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
-    (0x705868, 'e10f1932', '01e08152', 'width w1 #0x780 → movz #0xf00', 'host-only'),
-    (0x705864, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
-    (0x711ee0, 'e10f1932', '01e08152', 'width w1 #0x780 → movz #0xf00', 'host-only'),
-    (0x711edc, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
-    (0x9c95d4, 'e10f1932', '01e08152', 'width w1 #0x780 → movz #0xf00', 'host-only'),
-    (0x9c95cc, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
-    (0x9c9bd0, 'e10f1932', '01e08152', 'width w1 #0x780 → movz #0xf00', 'host-only'),
-    (0x9c9bc8, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
-    (0xe7678, '02106f1e', '0210611e', 'docked scale of the base resolution fmov d2,#1.5 → #3.0 (1280x720 → 3840x2160)', 'host-only'),
-    (0xfba7c, '01106f1e', '0110611e', 'docked scale of the base resolution fmov d1,#1.5 → #3.0 (1280x720 → 3840x2160)', 'host-only'),
-    (0xfbd24, '01106f1e', '0110611e', 'docked scale of the base resolution fmov d1,#1.5 → #3.0 (1280x720 → 3840x2160)', 'host-only'),
-    (0x89ad20, '02106f1e', '0210611e', 'docked scale of the base resolution fmov d2,#1.5 → #3.0 (1280x720 → 3840x2160)', 'host-only'),
-    (0xfcaa8, '00106f1e', '0010611e', 'four-layer ambient occlusion array size: fmov #1.5 → #3.0', 'host-only'),
-    (0x89b14c, '01106f1e', '0110611e', 'scaled screen size (level 2): fmov #1.5 → #3.0', 'host-only'),
-    (0x89b1dc, '01106f1e', '0110611e', 'scaled screen size (level 2, second getter): fmov #1.5 → #3.0', 'host-only'),
-    (0x89ae6c, '01102f1e', '0110211e', 'scale factor of level 2: fmov #1.5 → #3.0', 'host-only'),
+    (0x706fa4, 'e10f1f32', {'60': 'e10f1e32', '90': '410b8052', '120': '010f8052'}[os.environ['DM_DSR_FPS']], f'frame limiter target mov w1,#30 → {os.environ["DM_DSR_FPS"]}', 'host-only'),
+  ] if os.environ.get('DM_DSR_FPS') in ('60', '90', '120') else []) + ([
+    # DM_DSR_RES=1440 or 2160: the six places that size the game's 1920x1080 targets (scene, post-process, swap chain; orr w1,wzr,#0x780 / mov w2,#0x438 before each create
+    # call) ask for 2560x1440 or 3840x2160 instead (movz: 0x870 is not a logical immediate), and the eight that scale its 1280x720 base by 1.5 for the TV (fmov #1.5: the main MSAA
+    # scene targets, the four-layer ambient occlusion array, the level-2 scaled screen size and its factor) scale by 2.0 or 3.0
+    (0x70558c, 'e10f1932', DSR_RES_W, 'width w1 #0x780 → movz', 'host-only'), (0x705588, '02878052', DSR_RES_H, 'height w2 #0x438 → movz', 'host-only'),
+    (0x705624, 'e10f1932', DSR_RES_W, 'width w1 #0x780 → movz', 'host-only'), (0x705620, '02878052', DSR_RES_H, 'height w2 #0x438 → movz', 'host-only'),
+    (0x705868, 'e10f1932', DSR_RES_W, 'width w1 #0x780 → movz', 'host-only'), (0x705864, '02878052', DSR_RES_H, 'height w2 #0x438 → movz', 'host-only'),
+    (0x711ee0, 'e10f1932', DSR_RES_W, 'width w1 #0x780 → movz', 'host-only'), (0x711edc, '02878052', DSR_RES_H, 'height w2 #0x438 → movz', 'host-only'),
+    (0x9c95d4, 'e10f1932', DSR_RES_W, 'width w1 #0x780 → movz', 'host-only'), (0x9c95cc, '02878052', DSR_RES_H, 'height w2 #0x438 → movz', 'host-only'),
+    (0x9c9bd0, 'e10f1932', DSR_RES_W, 'width w1 #0x780 → movz', 'host-only'), (0x9c9bc8, '02878052', DSR_RES_H, 'height w2 #0x438 → movz', 'host-only'),
+  ] + [(o, w, dsr_fmov(w), what + ': fmov #1.5 → ' + {'1440': '#2.0', '2160': '#3.0'}[os.environ['DM_DSR_RES']], 'host-only') for o, w, what in (
+    (0xe7678, '02106f1e', 'docked scale of the base resolution'), (0xfba7c, '01106f1e', 'docked scale of the base resolution'),
+    (0xfbd24, '01106f1e', 'docked scale of the base resolution'), (0x89ad20, '02106f1e', 'docked scale of the base resolution'),
+    (0xfcaa8, '00106f1e', 'four-layer ambient occlusion array size'), (0x89b14c, '01106f1e', 'scaled screen size (level 2)'),
+    (0x89b1dc, '01106f1e', 'scaled screen size (level 2, second getter)'), (0x89ae6c, '01102f1e', 'scale factor of level 2'))] + [
     # the 1.63 GB allocator partition carved from the main heap at start (mov w19,#0x68000000) runs out with 4K targets: 3.63 GB, with the host's DM_APP_POOL raised to match
     (0x66f4c8, '1300ad52', '1300bd52', 'main allocator partition mov w19,#0x68000000 → #0xe8000000', 'host-only'),
-  ] if os.environ.get('DM_DSR_RES') == '2160' else []),
+  ] if os.environ.get('DM_DSR_RES') in ('1440', '2160') else []),
   # Super Mario Bros. Wonder v0 main
   'cd6e42aee7934f4d8393cd43893ae25e': [
     # Resource heap slack: each resource unit's ExpHeap is created with the resource size table value + 0x1008 (main+0x1e603c → ExpHeap::create main+0x4aac38); the table holds Nintendo's measured peaks with almost no margin
@@ -1099,12 +1094,13 @@ for oa, wa, ob_, wb, r, key, why in params:
 # State page = the page after the key page (zero in the file, read-write in both loaders): +0 float target fps written by the loader (fps_target, DM_FPS_TARGET; 0 = every stub
 # runs the original instructions), +4 TOTK movie flag, +8 double lead (TOTK legacy), +0x10 float render scale (TOTK, below), +0x18 double game seconds (TOTK legacy),
 # +0x20 u32 step in vsyncs (host; 0 = not decided yet), +0x24 u32 a step the game fixes itself (BotW's VFR override; 0 = none), +0x28 u32 mode (loader: 0 = whole vsyncs, 1 = legacy),
-# +0x30 u64 vsyncs stepped (the stubs; logged by the host to check the game's speed). Legacy (DM_FRAME_STEP=legacy, profile frame_step) is each game's earlier method, kept for
+# +0x30 u64 vsyncs stepped (the stubs; logged by the host to check the game's speed), +0x38 float frame time in seconds (host, every present; read by DSR_STEP). Legacy (DM_FRAME_STEP=legacy, profile frame_step) is each game's earlier method, kept for
 # the iPhone A/B test: TOTK's elapsed-time step (below); for BotW the loader writes target 0 (its own interval controller with the 60 fps cuts above). The value per build is
 # whether legacy keeps the state page on (fixups FPS_LEGACY_ELAPSED). Stub bodies assembled with clang
 FRAME_STEP = {'277178b7dba1b6d4949a84778d4abc58': 1, 'cd57b23fa4bbad65803d9788c01821ee': 0}
 FS_STATE_OFF = 0
-if BUILD_ID in FRAME_STEP and NAME == 'main':
+DSR_STEP = BUILD_ID == 'df3766a2bb651a3e822828abf10b6f7b' and os.environ.get('DM_DSR_FPS') in ('60', '90', '120')
+if (BUILD_ID in FRAME_STEP or DSR_STEP) and NAME == 'main':
     FS_STATE_OFF = KEY_PAGE_OFF + 0x4000
     assert not FAR and FS_STATE_OFF % 0x1000 == 0 and FS_STATE_OFF + 0x40 <= PATCH_OFF and not any(IMG[FS_STATE_OFF:]), 'frame step state page'
     def fs_site(off, orig):
@@ -1121,6 +1117,19 @@ if BUILD_ID in FRAME_STEP and NAME == 'main':
 # sites) the same, which the consumers read. Legacy: the step is the measured frame time (timing frame +0xd8, 19.2 MHz ticks), clamped to [1 / cap, 1 / 15 s]; game time that ran
 # ahead after a short frame (the "lead", at most 0.25 s; totk-mobile) is paid back by later frames. Prerendered movies set a 30 cap (flag set and cleared around main+0x2b36100 /
 # main+0x2b33918), the D-pad menu fade starts at full rate (FPSLocker's fix at main+0x1fbc80) and the swapchain argument at main+0xbe14a8 becomes 1 as in FPSLocker
+# Dark Souls Remastered (DSR_STEP): the per-frame update (main+0x6678d0) advances every system by one constant step loaded at main+0x667904 (1/30 in rodata). The stub loads the
+# host's frame time instead (state +0x38, float seconds: hle_nvn.c, the time between presents, exactly the period when within 4 % of it, clamped to 1/30), so game time = real time
+# when the machine does not hold the target (4K at 120 fps); 0 before the first present keeps a constant (1/60 for 60 and 90, 1/120 for 120). x16 is unused in that function
+if FS_STATE_OFF and DSR_STEP:
+    fs_site(0x667904, '08ed46bd')
+    start = here(); emit(ADRP(16, here(), FS_STATE_OFF))
+    for w in (0xbd403a08,   # ldr s8,[x16,#0x38]   host frame time
+              0x1e202108,   # fcmp s8,#0.0
+              0x54000041,   # b.ne end (+8)
+              0xbd67a908 if os.environ['DM_DSR_FPS'] == '120' else 0xbd483508):   # ldr s8,[x8,#0x27a8] (1/120) or [x8,#0x834] (1/60)
+        emit(w)
+    emit(B(here(), 0x667908))
+    fs_put(0x667904, [B(0x667904, start)], 'per-frame time step from the host frame time (state +0x38)')
 if FS_STATE_OFF and BUILD_ID == '277178b7dba1b6d4949a84778d4abc58':
     # frame step (replaces ldrb w9,[x0,#0x58], the first instruction after the prologue)
     fs_site(0x2db18c, '09604139')
@@ -1390,7 +1399,7 @@ with open(P('fixups.tsv'), 'w') as f:
     f.write(f'# PATCH_OFF\t{PATCH_OFF:#x}\n# KEY_PAGE_OFF\t{KEY_PAGE_OFF:#x}\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t{TEXT_END:#x}\n# RO_OFF\t{RO_OFF:#x}\n# DATA_OFF\t{DATA_OFF:#x}\n')
     if FAR: f.write(f'# IMAGE_SIZE\t{IMAGE_SIZE:#x}\n# FILE_IMAGE_LEN\t{FILE_IMAGE_LEN:#x}\n')   # patch area before the base (negative PATCH_OFF): whole image size, length of the image part of the file
     for k in KEY_INDEX: f.write(f'# KEY_{k}_IDX\t{KEY_INDEX[k]}\n')
-    if FS_STATE_OFF: f.write(f'# FPS_STATE_OFF\t{FS_STATE_OFF:#x}\n# FPS_LEGACY_ELAPSED\t{FRAME_STEP[BUILD_ID]:#x}\n')   # frame step state page (FRAME_STEP): the loader writes the target fps and the mode there
+    if FS_STATE_OFF: f.write(f'# FPS_STATE_OFF\t{FS_STATE_OFF:#x}\n# FPS_LEGACY_ELAPSED\t{FRAME_STEP.get(BUILD_ID, 0):#x}\n')   # frame step state page (FRAME_STEP): the loader writes the target fps and the mode there
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')   # the host identifies the build by it: features with hard-coded addresses only run on the build they belong to
 with open(P('gates.tsv'), 'w') as f:
     for ret, k, arg, orig in gates: f.write(f'{ret:#x}\t{k}\t{arg}\t{orig:#x}\n')

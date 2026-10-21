@@ -1456,6 +1456,13 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     { static int gate;
       if (!gate && g_nvn_loadscreen_up && g_nvn_loadscreen_up()) { gate = 1; int ms = mtl_warm_wait(15000); if (ms) LOG("[nvn] the loading screen into the run waited %d ms for pipeline prewarm", ms); } }
     present_cfg(o);
+    // Frame time for a game whose stub steps by it (state +0x38; Dark Souls Remastered, patch_nso.py DSR_STEP): the time between presents, exactly the present period when
+    // within 4 % of it (an even step while the rate holds), at most 1/30 s (the game's own step; loads and stalls)
+    if (dm_fps_state && g_hz > 0) {
+        static uint64_t prev; uint64_t t = now_ns();
+        if (prev) { double dt = (t - prev) / 1e9, p = 1.0 / g_hz; if (dt > p * 0.96 && dt < p * 1.04) dt = p; if (dt > 1.0 / 30) dt = 1.0 / 30; float f = (float)dt; memcpy(dm_fps_state + 0x38, &f, sizeof f); }
+        prev = t;
+    }
     {
         // Test switch DM_TEST_PRESENT_LAG=every N presents,milliseconds: sleep that long before the Nth, 2Nth… present, imitating an occasional slow frame on a phone (Mario 1.2.1 then sets present interval 2; checks that the display link holds frames by interval). Not set in the product
         static int lag_n = -1, lag_ms; if (lag_n < 0) { const char *e = getenv("DM_TEST_PRESENT_LAG"); lag_n = 0; if (e && sscanf(e, "%d,%d", &lag_n, &lag_ms) == 2 && lag_n > 0) LOG("DM_TEST_PRESENT_LAG: every %d presents, sleep an extra %d ms", lag_n, lag_ms); else lag_n = 0; }
