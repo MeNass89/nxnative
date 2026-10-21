@@ -3179,11 +3179,12 @@ static id<MTLFunction> vnat_fn(NvShader *vs, int n, const int *loc, const int *c
     return fn;
 }
 static void vconv_bind(id<MTL4RenderCommandEncoder> en, NvShader *vs, const p_draw *dw, const p_draw_idx *di) {
-    uint64_t vlo = 0, vhi = 0; int have_span = vconv_span(dw, di, &vlo, &vhi);
+    uint64_t vlo = 0, vhi = 0; int have_span = -1;   // the draw's vertex range, read from the index buffer only when an input is converted here (scanning every indexed draw's indices was half the replay)
     const nvn_refl *rf = &vs->rf; int slot = VCONV_SLOT0;
     for (int v = 0; v < rf->nv && slot < VCONV_SLOT0 + VCONV_MAX; v++) {
         if (!vconv_wanted(rf, v, NULL) || rf->v[v].nvn >= S.nattr) continue;
         if (!vs->vnat_fail && vnat_type(S.attr[rf->v[v].nvn].fmt) >= 0) continue;   // fetched natively by the pipeline's vertex variant
+        if (have_span < 0) have_span = vconv_span(dw, di, &vlo, &vhi);
         int a = rf->v[v].nvn, st = S.attr[a].stream, f = S.attr[a].fmt; uint32_t off = S.attr[a].offset, stride = st < 16 ? S.stream[st].stride : 0;
         uint64_t addr = st < 16 ? S.vbuf[st].address : 0, size = st < 16 ? S.vbuf[st].size : 0, gpu = 0, skip = 0;
         if (have_span && stride && st < 16 && !S.stream[st].divisor) {   // only the vertices this draw reads; the buffer bound is offset back so vertex i still lands at element i
