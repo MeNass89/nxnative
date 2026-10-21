@@ -2420,7 +2420,7 @@ static void shmap_load(void) {
     warm_start();
 }
 
-@interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, afr; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
+@interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; int vnat_fail; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, afr; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     // The argument buffer encoded last time
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass;   // ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn; } @end   // bflib: readable-tile version <key>_bf (merge B step 2)
@@ -3143,11 +3143,47 @@ static int vconv_span(const p_draw *dw, const p_draw_idx *di, uint64_t *lo, uint
     int64_t a = (int64_t)mn + di->base_vertex, b = (int64_t)mx + di->base_vertex + 1; if (a < 0) return 0;
     *lo = (uint64_t)a; *hi = (uint64_t)b; return 1;
 }
-static void vconv_bind(id<MTL4RenderCommandEncoder> en, const nvn_refl *rf, const p_draw *dw, const p_draw_idx *di) {
+// Native fetch instead of the conversion: Metal can fetch these formats itself, only into an input of another type (an integer format into an integer input of the same sign, a
+// normalized / half / packed float format into a float input). The pipeline then uses a variant of the vertex shader whose input is declared in that type and bit-cast back to the
+// declared one at each use (vnat_fn): the 32-bit register values Maxwell's fetch makes, with no CPU work. Dark Souls Remastered: its world meshes are 16-bit integers into integer inputs
+// of the other sign, about 360 ranges a frame that the CPU converted (5 ms of the submit thread, more when the camera turns and the ranges are new)
+static MTLVertexFormat vfmt(int f);
+static int vnat_type(int f) {   // NVN_CT_* of the input a native fetch of NVN format f fills; -1 = Metal has no such fetch (converted on the CPU)
+    int ib, is; if (vconv_i2f(f, &ib, &is) || vfmt(f) == MTLVertexFormatInvalid) return -1;
+    if (vconv_int(f, &ib, &is)) return is ? NVN_CT_INT : NVN_CT_UINT;
+    return vconv_ncomp(f) ? NVN_CT_FLOAT : -1;
+}
+static id<MTLFunction> vnat_fn(NvShader *vs, int n, const int *loc, const int *ct) {
+    static NSMutableDictionary *cache; static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT; static const char *const tn[3] = {"float", "uint", "int"};
+    NSMutableString *ck = [NSMutableString stringWithFormat:@"%s|%@", vs->key, vs->fn.name];
+    for (int i = 0; i < n; i++) [ck appendFormat:@"|%d:%d", loc[i], ct[i]];
+    os_unfair_lock_lock(&lk); if (!cache) cache = [NSMutableDictionary dictionary];
+    id f = cache[ck]; os_unfair_lock_unlock(&lk);
+    if (f) return f == NSNull.null ? nil : f;
+    NSMutableString *src = [NSMutableString stringWithContentsOfFile:[NSString stringWithFormat:@"%@/%s.metal", g_msl_dir, vs->key] encoding:NSUTF8StringEncoding error:nil];
+    const char *why = src ? NULL : "no MSL source";
+    for (int i = 0; i < n && !why; i++) {   // "uint4 m_23 [[attribute(1)]]" -> "int4 m_23 [[attribute(1)]]", each "in.m_23" -> "as_type<uint4>(in.m_23)"
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"\\b(float|uint|int)([234]?) (\\w+) \\[\\[attribute\\(%d\\)\\]\\]", loc[i]] options:0 error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:src options:0 range:NSMakeRange(0, src.length)];
+        if (!m) { why = "input declaration not found"; break; }
+        NSString *w = [src substringWithRange:[m rangeAtIndex:2]], *name = [src substringWithRange:[m rangeAtIndex:3]], *old = [[src substringWithRange:[m rangeAtIndex:1]] stringByAppendingString:w];
+        [src replaceCharactersInRange:[m rangeAtIndex:1] withString:@(tn[ct[i]])];
+        NSRegularExpression *use = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"\\bin\\.%@\\b", name] options:0 error:nil];
+        [use replaceMatchesInString:src options:0 range:NSMakeRange(0, src.length) withTemplate:[NSString stringWithFormat:@"as_type<%@>(in.%@)", old, name]];
+    }
+    NSError *e = nil; id<MTLFunction> fn = nil;
+    if (!why) { id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:nil error:&e]; fn = lib ? [lib newFunctionWithName:vs->fn.name] : nil; if (!fn) why = e ? e.localizedDescription.UTF8String : "no entry point"; }
+    if (!fn) MLOG("[RED] native vertex fetch variant of %s failed (%s): its converted inputs stay on the CPU", vs->key, why);
+    else { static int k; if (!k++) MLOG("native vertex fetch: first variant %s (%d inputs)", vs->key, n); }
+    os_unfair_lock_lock(&lk); cache[ck] = fn ?: (id)NSNull.null; os_unfair_lock_unlock(&lk);
+    return fn;
+}
+static void vconv_bind(id<MTL4RenderCommandEncoder> en, NvShader *vs, const p_draw *dw, const p_draw_idx *di) {
     uint64_t vlo = 0, vhi = 0; int have_span = vconv_span(dw, di, &vlo, &vhi);
-    int slot = VCONV_SLOT0;
+    const nvn_refl *rf = &vs->rf; int slot = VCONV_SLOT0;
     for (int v = 0; v < rf->nv && slot < VCONV_SLOT0 + VCONV_MAX; v++) {
         if (!vconv_wanted(rf, v, NULL) || rf->v[v].nvn >= S.nattr) continue;
+        if (!vs->vnat_fail && vnat_type(S.attr[rf->v[v].nvn].fmt) >= 0) continue;   // fetched natively by the pipeline's vertex variant
         int a = rf->v[v].nvn, st = S.attr[a].stream, f = S.attr[a].fmt; uint32_t off = S.attr[a].offset, stride = st < 16 ? S.stream[st].stride : 0;
         uint64_t addr = st < 16 ? S.vbuf[st].address : 0, size = st < 16 ? S.vbuf[st].size : 0, gpu = 0, skip = 0;
         if (have_span && stride && st < 16 && !S.stream[st].divisor) {   // only the vertices this draw reads; the buffer bound is offset back so vertex i still lands at element i
@@ -3307,7 +3343,7 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
     }
     d.depthAttachmentPixelFormat = (MTLPixelFormat)k->dfmt; d.stencilAttachmentPixelFormat = (MTLPixelFormat)k->sfmt;
     MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
-    const nvn_refl *rf = &vs->rf; int nconv = 0;
+    const nvn_refl *rf = &vs->rf; int nconv = 0, nnat = 0, nat_loc[16], nat_ct[16];
     for (int v = 0; v < rf->nv; v++) {
         int loc = rf->v[v].loc, a = rf->v[v].nvn;   // Metal slot loc ← NVN attribute a
         MTLVertexFormat vf = a < 16 ? vfmt(k->attr[a].fmt) : MTLVertexFormatInvalid;
@@ -3321,7 +3357,8 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
             continue;
         }
         int st = k->attr[a].stream;
-        if (vconv_wanted(rf, v, k) && nconv < VCONV_MAX) {   // converted on the CPU at draw time (vconv_bind): the register's 32-bit values, 4 components, its own slot
+        if (vconv_wanted(rf, v, k) && !vs->vnat_fail && nnat < 16 && vnat_type(k->attr[a].fmt) >= 0) { nat_loc[nnat] = loc; nat_ct[nnat++] = vnat_type(k->attr[a].fmt); }   // native fetch (vnat_fn): the format as is
+        else if (vconv_wanted(rf, v, k) && nconv < VCONV_MAX) {   // converted on the CPU at draw time (vconv_bind): the register's 32-bit values, 4 components, its own slot
             int slot = VCONV_SLOT0 + nconv++;
             vd.attributes[loc].format = rf->v[v].ct == NVN_CT_UINT ? MTLVertexFormatUInt4 : rf->v[v].ct == NVN_CT_INT ? MTLVertexFormatInt4 : MTLVertexFormatFloat4; vd.attributes[loc].offset = 0; vd.attributes[loc].bufferIndex = slot;
             vd.layouts[slot].stride = 16;
@@ -3329,13 +3366,14 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
             vd.layouts[slot].stepRate = k->stream[st].stride == 0 ? 0 : k->stream[st].divisor ? k->stream[st].divisor : 1;
             continue;
         }
-        vf = vfmt_for_ct(vf, rf->v[v].ct, k->attr[a].fmt);
+        if (!(nnat && nat_loc[nnat - 1] == loc)) vf = vfmt_for_ct(vf, rf->v[v].ct, k->attr[a].fmt);
         vd.attributes[loc].format = vf; vd.attributes[loc].offset = k->attr[a].offset; vd.attributes[loc].bufferIndex = VB_SLOT(st);
         vd.layouts[VB_SLOT(st)].stride = k->stream[st].stride ? k->stream[st].stride : 4;
         vd.layouts[VB_SLOT(st)].stepFunction = k->stream[st].stride == 0 ? MTLVertexStepFunctionConstant : k->stream[st].divisor ? MTLVertexStepFunctionPerInstance : MTLVertexStepFunctionPerVertex;
         vd.layouts[VB_SLOT(st)].stepRate = k->stream[st].stride == 0 ? 0 : k->stream[st].divisor ? k->stream[st].divisor : 1;
     }
     d.vertexDescriptor = vd;
+    if (nnat) { id<MTLFunction> vf = vnat_fn(vs, nnat, nat_loc, nat_ct); if (vf) d.vertexFunction = vf; else { vs->vnat_fail = 1; return pso_desc(k, vs, fs, fsfn, merged); } }
     return d;
 }
 // Pipeline key: current state S + pass formats (normal pass; a merged pass additionally carries lmap / specialized function, filled in by pso_get)
@@ -3414,6 +3452,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRe
         ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
     }
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
+    if (bp_now() - bt > 100000000ull) MLOG("slow pipeline: %.0f ms (vertex %s fragment %s%s)", (bp_now() - bt) / 1e6, vs->key, fs ? fs->key : "-", k.atest ? ", alpha test" : "");
     if (!ps) { char hint[200]; MLOG("[RED] failed to create render pipeline (vertex %s fragment %s): %s%s", vs->key, fs ? fs->key : "-", e.localizedDescription.UTF8String, pso_fout_hint(fs, g_pass.cfmt, hint, sizeof hint));
                hm_put_id(&g_pso_fail, &k, NSNull.null); return nil; }
     if (!ms_fn) { pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&k, vs, fs, g_pso_lmap != NULL, g_pso_lmap ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
@@ -5778,7 +5817,7 @@ frz_plain:;
     static id<MTLBuffer> zero; if (!zero) { zero = [g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared]; res_add(zero); }
     static uint64_t zero_gpu; if (!zero_gpu) zero_gpu = zero.gpuAddress;
     enc_r_vbuf(en, 30, zero_gpu);
-    if (pr->sh[0]) vconv_bind(en, &pr->sh[0]->rf, dw, di);   // integer inputs fed float-type formats or 8 / 16-bit integers of the other sign (see vconv_ncomp, vconv_int)
+    if (pr->sh[0]) vconv_bind(en, pr->sh[0], dw, di);   // integer inputs fed float-type formats or 8 / 16-bit integers of the other sign (see vconv_ncomp, vconv_int)
     g_kd_force = kd_draw(pr, dw, di);
     if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
     if (pr->sh[1]) encode_args(en, pr->sh[1], 1, 0);
