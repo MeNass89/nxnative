@@ -55,11 +55,15 @@ CUTS = {
   # DARK SOULS: REMASTERED 1.0.3 (v196608) main: 60 fps (masagrator's FPSLocker-Warehouse config and ChanseyIsTheBest's cheat for this build, DF3766A2BB651A3E).
   # main+0x706fa4 hands the frame limiter its target (mov w1,#30 → #60); main+0x667904 loads the game's time step per frame from rodata (1/30 at +0x167a6ec → 1/60 at +0x167a834,
   # a constant already in the image), so the world advances at normal speed at 60. Known on the Switch: ladders climb oddly at 60 (the mod advises 30 for them); cutscenes drop to 30.
-  # Off unless the rewrite runs with DM_DSR_FPS=60: the 30 fps game is the verified one.
+  # Off unless the rewrite runs with DM_DSR_FPS=60: the 30 fps game is the verified one. DM_DSR_FPS=120 the same way: target 120 and the time step 1/120 (+0x167c7a8, also in the image,
+  # in reach of the same load), for a 120 Hz display; the host presents at 120 only with DM_PRESENT_HZ=120.
   'df3766a2bb651a3e822828abf10b6f7b': [
     (0x706fa4, 'e10f1f32', 'e10f1e32', 'frame limiter target mov w1,#30 → mov w1,#60', 'host-only'),
     (0x667904, '08ed46bd', '083548bd', 'per-frame time step ldr s8,[x8,#0x6ec] (1/30) → ldr s8,[x8,#0x834] (1/60)', 'host-only'),
-  ] if os.environ.get('DM_DSR_FPS') == '60' else [],
+  ] if os.environ.get('DM_DSR_FPS') == '60' else [
+    (0x706fa4, 'e10f1f32', '010f8052', 'frame limiter target mov w1,#30 → movz w1,#120', 'host-only'),
+    (0x667904, '08ed46bd', '08a967bd', 'per-frame time step ldr s8,[x8,#0x6ec] (1/30) → ldr s8,[x8,#0x27a8] (1/120)', 'host-only'),
+  ] if os.environ.get('DM_DSR_FPS') == '120' else [],
   # Super Mario Bros. Wonder v0 main
   'cd6e42aee7934f4d8393cd43893ae25e': [
     # Resource heap slack: each resource unit's ExpHeap is created with the resource size table value + 0x1008 (main+0x1e603c → ExpHeap::create main+0x4aac38); the table holds Nintendo's measured peaks with almost no margin

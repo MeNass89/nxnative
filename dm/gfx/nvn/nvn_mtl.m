@@ -1747,8 +1747,10 @@ static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw,
 // DM_NVN_PASSDUMP: records pass attachments / samples / presents one by one (textures by serial) for offline data-flow analysis; the pass numbers of P / D / R / S lines agree (= g_stat_pass after the pass is opened)
 // DM_NVN_PASSDUMP=frame number, or start-end (inclusive at both ends)
 static int g_kd_force;   // the draw DM_NVN_KEYDUMP matched: force the per-binding records on (see kd_draw)
+static long g_pd_auto = -1;   // frame DM_NVN_WHITE_TRIGGER picked: also pass-dumped
 static int passdump(void) {
     if (g_kd_force) return 1;
+    if (g_pd_auto >= 0 && (long)atomic_load(&g_cur_frame) == g_pd_auto) return 1;
 #ifdef NVN_RT_RANGE_TEST
     if (g_rr_checking) return 0;
 #endif
@@ -7300,6 +7302,19 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (nshot < 0) {
         nshot = 0; const char *e = getenv("DM_NVN_SHOT"), *c = e ? strchr(e, ':') : NULL;
         if (c) { shot_path = c + 1; for (const char *q = e; q < c && nshot < 4096; q = strchr(q, ',') ? strchr(q, ',') + 1 : c) shots[nshot++] = atol(q); }
+    }
+    {   // Diagnostic DM_NVN_WHITE_TRIGGER=<percent>[,<first frame>] with DM_NVN_TEXDUMP=999999999:<path> (and DM_NVN_TEXSNAP): when more than that share of a presented picture is pure white,
+        // dump the next frame (its passes with TEXSNAP), once - for white flashes whose frame is not known in advance
+        static double wt = -1; static long wf; if (wt < 0) { const char *e = getenv("DM_NVN_WHITE_TRIGGER"); wt = e ? atof(e) : 0; wf = e && strchr(e, ',') ? atol(strchr(e, ',') + 1) : 0; }
+        if (wt > 0 && g_td_frame >= 999999999 && (long)g_present_n >= wf && (src.pixelFormat == MTLPixelFormatRGBA8Unorm || src.pixelFormat == MTLPixelFormatBGRA8Unorm)) {
+            size_t w = src.width, h = src.height, row = w * 4; id<MTLBuffer> buf = [g_dev newBufferWithLength:row * h options:MTLResourceStorageModeShared];
+            mtl_finish_gpu(); id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+            [bl copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row * h];
+            [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            const uint8_t *p = buf.contents; size_t n = 0, white = 0;
+            for (size_t y = 0; y < h; y += 8) for (size_t x = 0; x < w; x += 8) { const uint8_t *q = p + y * row + x * 4; n++; white += q[0] >= 250 && q[1] >= 250 && q[2] >= 250; }
+            if (n && 100.0 * white / n > wt) { g_td_frame = g_pd_auto = (long)atomic_load(&g_cur_frame) + 1; MLOG("white trigger: present %llu is %.1f%% pure white, dumping frame %ld", (unsigned long long)g_present_n, 100.0 * white / n, g_td_frame); }
+        }
     }
     for (int i = 0; i < nshot; i++) if ((long)g_present_n == shots[i]) { char path[1024]; snprintf(path, sizeof path, shot_path, (int)g_present_n); mtl_finish_gpu(); shot(src, path, 1, crop); }
     pthread_mutex_lock(&g_shotq_mu);
