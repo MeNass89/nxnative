@@ -575,9 +575,22 @@ static holemap *hm_load(const char *hostpath) {
       if (!atomic_exchange(&said[h % 64], 1)) LOG("zero-stripped archive %s: original %lld bytes, stored %lld bytes, %d kept segments", m->name, (long long)size, (long long)phys, m->n); }
     return m;
 }
-void dm_data_note_fd(int fd, const char *hostpath) {   // Called after opening a resource archive: register it if there is an extent table
+// Appended archives (mods): "<archive name>.append" in a RomFS overlay directory (DM_ROMFS_OVERLAY) holds bytes that follow the archive's own end: the file reads and reports
+// as archive + append. A mod installer appends the replacement files there and rewrites the archive's index (also in the overlay) to point past the original end, so the
+// multi-gigabyte archive itself is never copied (Dark Souls Remastered: dvdbnd0.bdt with an overlay dvdbnd0.bhd5)
+static struct { int fd; int64_t base, size; } g_ap[4096];   // fd + 1 of the open append file (0 = none), the archive's own size, the append size
+static int append_path(const char *hostpath, char *out, size_t n) { const char *bn = strrchr(hostpath, '/'); char rel[300]; snprintf(rel, sizeof rel, "%s.append", bn ? bn + 1 : hostpath); return dm_overlay_file(rel, out, n); }
+void dm_data_note_fd(int fd, const char *hostpath) {   // Called after opening a resource archive: register it if there is an extent table or an append file
     if (fd < 0 || fd >= 4096) return;
     g_hm[fd] = hm_load(hostpath);
+    if (g_ap[fd].fd) { close(g_ap[fd].fd - 1); g_ap[fd].fd = 0; }
+    char ap[1100]; struct stat st, sa;
+    if (!g_hm[fd] && append_path(hostpath, ap, sizeof ap) && !fstat(fd, &st)) {
+        int afd = open(ap, O_RDONLY);
+        if (afd >= 0 && !fstat(afd, &sa)) { g_ap[fd].fd = afd + 1; g_ap[fd].base = st.st_size; g_ap[fd].size = sa.st_size;
+            static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) LOG("appended archive %s: %lld bytes + %lld from %s", hostpath, (long long)st.st_size, (long long)sa.st_size, ap); }
+        else if (afd >= 0) close(afd);
+    }
 }
 // Same as dm_data_logical_size, but opened relative to the directory fd: listing does not resolve the long path from the root again for every entry
 static int64_t data_logical_size_at(int dfd, const char *name, int64_t phys_size) {
@@ -586,12 +599,16 @@ static int64_t data_logical_size_at(int dfd, const char *name, int64_t phys_size
     FILE *f = fdopen(fd, "r"); if (!f) { close(fd); return phys_size; }
     long long size = -1; int ok = fscanf(f, "size %lld", &size) == 1; fclose(f); return ok && size >= 0 ? size : phys_size;
 }
-int64_t dm_data_logical_size(const char *hostpath, int64_t phys_size) {   // For directory listing / size queries: report the original size when there is an extent table
+int64_t dm_data_logical_size(const char *hostpath, int64_t phys_size) {   // For directory listing / size queries: report the original size when there is an extent table, plus an append file
     char hp2[1100]; if (snprintf(hp2, sizeof hp2, "%s.holes", hostpath) >= (int)sizeof hp2) return phys_size;
-    FILE *f = fopen(hp2, "r"); if (!f) return phys_size; long long size = -1; int ok = fscanf(f, "size %lld", &size) == 1; fclose(f); return ok && size >= 0 ? size : phys_size;
+    FILE *f = fopen(hp2, "r"); if (!f) { struct stat sa; return append_path(hostpath, hp2, sizeof hp2) && !stat(hp2, &sa) ? phys_size + sa.st_size : phys_size; } long long size = -1; int ok = fscanf(f, "size %lld", &size) == 1; fclose(f); return ok && size >= 0 ? size : phys_size;
 }
 ssize_t dm_data_pread(int fd, void *buf, size_t n, off_t off) {   // Same semantics as pread (may short-read); zero-stripped archives are translated through the extent table
     holemap *m = fd >= 0 && fd < 4096 ? g_hm[fd] : NULL;
+    if (!m && fd >= 0 && fd < 4096 && g_ap[fd].fd) {   // appended archive: past the archive's end the bytes come from the append file (a read never spans both: short read at the boundary)
+        if (off >= g_ap[fd].base) return pread(g_ap[fd].fd - 1, buf, n, off - g_ap[fd].base);
+        if ((int64_t)n > g_ap[fd].base - off) n = (size_t)(g_ap[fd].base - off);
+    }
     if (!m) return pread(fd, buf, n, off);
     if (off >= m->size) return 0;
     if ((int64_t)n > m->size - off) n = (size_t)(m->size - off);
@@ -684,7 +701,7 @@ HLE_FORCE("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", "fsp
 HLE_FORCE("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", "fsp-srv → fstat(2)", Result, h_fs_GetFileSize, int64_t *out, uint64_t h) {
     if (!h) return RES_FAIL;
     struct stat st; if (fstat((int)h, &st)) return err_res("fstat", "fd");
-    *out = (int)h < 4096 && g_hm[(int)h] ? g_hm[(int)h]->size : st.st_size;
+    *out = (int)h < 4096 && g_hm[(int)h] ? g_hm[(int)h]->size : (int)h < 4096 && g_ap[(int)h].fd ? g_ap[(int)h].base + g_ap[(int)h].size : st.st_size;
     { static int dbg = -1, n; if (dbg < 0) dbg = getenv("DM_FS_SIZE") != NULL; if (dbg && (n++ < 40 || n % 1000 == 0)) LOG("fs GetFileSize #%d fd %d → %lld", n, (int)h, (long long)*out); }
     return RES_OK;
 }
@@ -699,6 +716,7 @@ HLE_FORCE("_ZN2nn2fs9CloseFileENS0_10FileHandleE", "fsp-srv → close(2)", void,
     if (!h) return;   // the null handle after a failed open (see ReadFile): do not touch fd 0
     g_fmode[(int)h & 0xffff] = 0; g_fsave[(int)h & 0xffff] = 0;
     if ((int)h >= 0 && (int)h < 4096 && g_hm[(int)h]) { holemap *m = g_hm[(int)h]; g_hm[(int)h] = NULL; free(m->log); free(m->len); free(m->phys); free(m); }
+    if ((int)h >= 0 && (int)h < 4096 && g_ap[(int)h].fd) { close(g_ap[(int)h].fd - 1); g_ap[(int)h].fd = 0; }
     close((int)h); }
 HLE_FORCE("_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE", "fsp-srv; the open mode is recorded by the host", int, h_fs_GetFileOpenMode, uint64_t h) { return g_fmode[(int)h & 0xffff]; }
 
