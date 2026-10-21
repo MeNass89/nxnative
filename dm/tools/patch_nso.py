@@ -57,13 +57,28 @@ CUTS = {
   # a constant already in the image), so the world advances at normal speed at 60. Known on the Switch: ladders climb oddly at 60 (the mod advises 30 for them); cutscenes drop to 30.
   # Off unless the rewrite runs with DM_DSR_FPS=60: the 30 fps game is the verified one. DM_DSR_FPS=120 the same way: target 120 and the time step 1/120 (+0x167c7a8, also in the image,
   # in reach of the same load), for a 120 Hz display; the host presents at 120 only with DM_PRESENT_HZ=120.
-  'df3766a2bb651a3e822828abf10b6f7b': [
+  'df3766a2bb651a3e822828abf10b6f7b': ([
     (0x706fa4, 'e10f1f32', 'e10f1e32', 'frame limiter target mov w1,#30 → mov w1,#60', 'host-only'),
     (0x667904, '08ed46bd', '083548bd', 'per-frame time step ldr s8,[x8,#0x6ec] (1/30) → ldr s8,[x8,#0x834] (1/60)', 'host-only'),
   ] if os.environ.get('DM_DSR_FPS') == '60' else [
     (0x706fa4, 'e10f1f32', '010f8052', 'frame limiter target mov w1,#30 → movz w1,#120', 'host-only'),
     (0x667904, '08ed46bd', '08a967bd', 'per-frame time step ldr s8,[x8,#0x6ec] (1/30) → ldr s8,[x8,#0x27a8] (1/120)', 'host-only'),
-  ] if os.environ.get('DM_DSR_FPS') == '120' else [],
+  ] if os.environ.get('DM_DSR_FPS') == '120' else []) + ([
+    # DM_DSR_RES=2160: the six places that size the game's 1920x1080 targets (scene, post-process, swap chain; orr w1,wzr,#0x780 / mov w2,#0x438 before each create call)
+    # ask for 3840x2160 instead (movz: 0x870 is not a logical immediate)
+    (0x70558c, 'e10f1932', '01e08152', 'width w1 #0x780 → movz #0xf00', 'host-only'),
+    (0x705588, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
+    (0x705624, 'e10f1932', '01e08152', 'width w1 #0x780 → movz #0xf00', 'host-only'),
+    (0x705620, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
+    (0x705868, 'e10f1932', '01e08152', 'width w1 #0x780 → movz #0xf00', 'host-only'),
+    (0x705864, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
+    (0x711ee0, 'e10f1932', '01e08152', 'width w1 #0x780 → movz #0xf00', 'host-only'),
+    (0x711edc, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
+    (0x9c95d4, 'e10f1932', '01e08152', 'width w1 #0x780 → movz #0xf00', 'host-only'),
+    (0x9c95cc, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
+    (0x9c9bd0, 'e10f1932', '01e08152', 'width w1 #0x780 → movz #0xf00', 'host-only'),
+    (0x9c9bc8, '02878052', '020e8152', 'height w2 #0x438 → movz #0x870', 'host-only'),
+  ] if os.environ.get('DM_DSR_RES') == '2160' else []),
   # Super Mario Bros. Wonder v0 main
   'cd6e42aee7934f4d8393cd43893ae25e': [
     # Resource heap slack: each resource unit's ExpHeap is created with the resource size table value + 0x1008 (main+0x1e603c → ExpHeap::create main+0x4aac38); the table holds Nintendo's measured peaks with almost no margin
