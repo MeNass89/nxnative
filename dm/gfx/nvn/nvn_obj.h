@@ -185,6 +185,7 @@ int mtl_tex_gpu_owned(uint64_t serial);                                  // its 
 // a stage whose code area was not yet in any memory pool then is computed the first time it is asked for. Returns 0 = no such stage
 int prog_key(const prog_t *p, unsigned stage, uint8_t key[8]);
 void mtl_reg_samp(int id, const samp_par *p);
+int nvn_dpool_base(const void *pool, int tex);   // replay base of a texture (tex = 1) or sampler descriptor pool
 void mtl_prog_release(prog_t *p);
 // New serial (> 0, globally increasing)
 uint64_t nvn_new_serial(void);

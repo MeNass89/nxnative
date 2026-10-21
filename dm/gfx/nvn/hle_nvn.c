@@ -207,6 +207,8 @@ static int dpool_add(struct dpool_base *t, int *nt, int *next, const void *pool,
     int b = t[i].base; pthread_mutex_unlock(&g_dpool_mu); return b;
 }
 static int dpool_base(const struct dpool_base *t, int nt, const void *pool) { for (int i = 0; i < nt; i++) if (t[i].pool == pool) return t[i].base; return 0; }
+// The replay's base for a pool object recorded by SetTexturePool / SetSamplerPool (texture: tex = 1): handles the shader reads from memory (bindless, in a uniform buffer) are raw pool IDs
+int nvn_dpool_base(const void *pool, int tex) { pthread_mutex_lock(&g_dpool_mu); int b = tex ? dpool_base(g_tpb, g_ntpb, pool) : dpool_base(g_spb, g_nspb, pool); pthread_mutex_unlock(&g_dpool_mu); return b; }
 // The pools each command buffer last bound, as bases (only command buffers that bound a pool other than the first one of its kind are listed)
 #define NCBPOOL 256
 static struct { const void *cmd; int tb, sb; } g_cbpool[NCBPOOL]; static int g_ncbpool;
