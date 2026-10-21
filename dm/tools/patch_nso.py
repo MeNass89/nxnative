@@ -82,6 +82,10 @@ CUTS = {
     (0xfba7c, '01106f1e', '0110611e', 'docked scale of the base resolution fmov d1,#1.5 → #3.0 (1280x720 → 3840x2160)', 'host-only'),
     (0xfbd24, '01106f1e', '0110611e', 'docked scale of the base resolution fmov d1,#1.5 → #3.0 (1280x720 → 3840x2160)', 'host-only'),
     (0x89ad20, '02106f1e', '0210611e', 'docked scale of the base resolution fmov d2,#1.5 → #3.0 (1280x720 → 3840x2160)', 'host-only'),
+    (0xfcaa8, '00106f1e', '0010611e', 'four-layer ambient occlusion array size: fmov #1.5 → #3.0', 'host-only'),
+    (0x89b14c, '01106f1e', '0110611e', 'scaled screen size (level 2): fmov #1.5 → #3.0', 'host-only'),
+    (0x89b1dc, '01106f1e', '0110611e', 'scaled screen size (level 2, second getter): fmov #1.5 → #3.0', 'host-only'),
+    (0x89ae6c, '01102f1e', '0110211e', 'scale factor of level 2: fmov #1.5 → #3.0', 'host-only'),
     # the 1.63 GB allocator partition carved from the main heap at start (mov w19,#0x68000000) runs out with 4K targets: 3.63 GB, with the host's DM_APP_POOL raised to match
     (0x66f4c8, '1300ad52', '1300bd52', 'main allocator partition mov w19,#0x68000000 → #0xe8000000', 'host-only'),
   ] if os.environ.get('DM_DSR_RES') == '2160' else []),
