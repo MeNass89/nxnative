@@ -182,10 +182,10 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
     if (ns > 0 && !det_wait) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
-    // Spin up to DM_SPIN_US (default 30) microseconds with G released before sleeping on the condition variable: most guest waits are hand-offs between the game's threads that
-    // end within microseconds, and a sleep + wake through the kernel cost far more on the critical path of a frame. Dark Souls Remastered, 120 fps build without a window:
-    // frame p50 8.8 -> 8.34 ms (held at 120) and CPU energy 4.6 -> 2.4 W (fewer context switches); at 60 fps frame p95 17.9 -> 17.1 ms over the 20-area sweep. DM_SPIN_US=0 turns it off
-    { static long spin = -1; if (spin < 0) { const char *e = getenv("DM_SPIN_US"); spin = e ? atol(e) : 30; }
+    // DM_SPIN_US=n: spin up to n microseconds with G released before sleeping on the condition variable: most guest waits are hand-offs between the game's threads that end within
+    // microseconds, and a sleep + wake through the kernel cost far more on the critical path of a frame. Dark Souls Remastered, 120 fps build: frame p50 8.8 -> 8.34 ms, CPU energy
+    // 4.6 -> 2.4 W. Off by default: with 30 us its first load after Continue never ended in about a quarter of boots at 120 fps (16/16 boots fine without; cause not found)
+    { static long spin = -1; if (spin < 0) { const char *e = getenv("DM_SPIN_US"); spin = e ? atol(e) : 0; }
       if (spin > 0 && ns != 0) { uint64_t end = now_ns() + (uint64_t)spin * 1000; pthread_mutex_unlock(&G);
           while (!__atomic_load_n(&t->woke, __ATOMIC_ACQUIRE) && now_ns() < end) __builtin_arm_yield();
           pthread_mutex_lock(&G); } }
