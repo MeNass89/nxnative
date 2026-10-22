@@ -115,7 +115,21 @@ void crash_set_trap_hook(int (*fn)(ucontext_t *uc)) { g_trap_hook = fn; }
 void crash_set_dump_hook(void (*fn)(void)) { g_dump_hook = fn; }
 void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
 // Dump the current state on demand (without exiting): the iOS app has no no-progress watchdog, so when the smoke test fails it sends dump through DM_LOG_PORT to trigger this -- what each guest thread is waiting on + the graphics-side wait points, the same thing the watchdog prints
-void crash_dump_now(const char *why) { fprintf(stderr, "[dm] state dump (%s): tick %u / stage %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
+// DM_DUMP_AT=addr:len[,addr:len...] (hex): with every state dump and crash report, print those memory ranges as 64-bit words (read with vm_read_overwrite, so an unmapped range prints "unreadable" instead of faulting).
+// For hangs where the waiting threads' registers do not show the shared object that matters (a queue head, a lock word): Dark Souls Remastered's load hang, its render job queue
+static void dump_at(void) {
+    const char *e = getenv("DM_DUMP_AT"); if (!e) return;
+    char spec[512]; strlcpy(spec, e, sizeof spec);
+    for (char *t = strtok(spec, ","); t; t = strtok(NULL, ",")) {
+        char *c = strchr(t, ':'); uint64_t a = strtoull(t, 0, 16), n = c ? strtoull(c + 1, 0, 16) : 0x40, w[4]; if (n > 0x1000) n = 0x1000;
+        for (uint64_t o = 0; o < n; o += sizeof w) {
+            vm_size_t got = 0;
+            if (vm_read_overwrite(mach_task_self(), (vm_address_t)(a + o), sizeof w, (vm_address_t)w, &got) != KERN_SUCCESS || got != sizeof w) { fprintf(stderr, "[dm] dump %#llx: unreadable\n", (unsigned long long)(a + o)); break; }
+            fprintf(stderr, "[dm] dump %#llx: %016llx %016llx %016llx %016llx\n", (unsigned long long)(a + o), (unsigned long long)w[0], (unsigned long long)w[1], (unsigned long long)w[2], (unsigned long long)w[3]);
+        }
+    }
+}
+void crash_dump_now(const char *why) { fprintf(stderr, "[dm] state dump (%s): tick %u / stage %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); dump_at(); }
 // Only the first crashing thread prints its state: when several threads crash at once (Unity's job threads often do), the dumps used to interleave and the process hung in the dump without exiting.
 // Later threads stop in pause() until the process exits; the first thread re-entering (crashing again while printing, or the SIGALRM of the 15 s safety below) exits at once.
 static _Atomic uintptr_t g_crash_owner;
@@ -176,6 +190,7 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
         }
         fputc('\n', stderr); }
     if (g_dump_hook) g_dump_hook();
+    dump_at();
     _exit(128 + sig);
 }
 // The signal alternate stack is per thread: every guest thread must call this when it starts running (only then can the crash state be printed on the alternate stack on a stack overflow)
