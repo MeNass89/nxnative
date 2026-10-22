@@ -77,6 +77,8 @@ void front_run(void (*guest)(void)) {
         g_layer.contentsScale = win.backingScaleFactor;
         v.layer = g_layer;
         [win center];
+        { const char *sc = getenv("DM_WINDOW_SCREEN"); NSArray<NSScreen *> *ss = NSScreen.screens; int i = sc ? atoi(sc) : -1;   // DM_WINDOW_SCREEN=<index in NSScreen.screens>: open on that screen (pacing tests on a second / virtual display)
+          if (i >= 0 && i < (int)ss.count) { NSRect f = ss[i].visibleFrame; [win setFrameOrigin:NSMakePoint(NSMidX(f) - win.frame.size.width / 2, NSMidY(f) - win.frame.size.height / 2)]; } }
         [win makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
         win.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;

@@ -2,6 +2,9 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CAMetalDisplayLink.h>
+#if TARGET_OS_OSX
+#import <AppKit/AppKit.h>
+#endif
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <mach/mach_time.h>
@@ -7341,6 +7344,72 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src0, id<M
     m4_end(en);
     return 1;
 }
+// ---------- Present grid (DM_PRESENT_GRID=1 with the classic present path, DM_PRESENT_LINK=0; off by default) ----------
+// Every frame gets a present deadline on a fixed grid of whole display vsyncs: target = previous target + hold (the frame's period in whole vsyncs), snapped to the vsync phase
+// read back from the latest presentedTime, and handed to presentAtTime. The present thread first waits for the frame's GPU work, so the target is chosen knowing the frame is ready:
+// a frame that cannot make its slot takes the next one (the previous frame stays one vsync longer) instead of going out early, and two frames never land in one vsync (the system
+// discards the earlier one). Before: plain present / presentAfterMinimumDuration as soon as the work finished, on a wall-clock beat not locked to the display: at 120 the minimum
+// duration was skipped (period < 1/61), presents bunched, 8-11 ms gaps at a 60 target and ~12 % of frames discarded (Dark Souls Remastered, player log 22/10).
+// After 4 missed slots in 60 frames the hold grows one vsync (120 → 60 → 40 → 30 on a 120 Hz screen, the next whole divisor, no 1/2-vsync alternation); a trial back down
+// after 4 s (doubled after each failed trial, up to 32 s). The game is woken on the same grid (mtl_grid_wake_ns) and steps its world by the scheduled interval (mtl_grid_iv_ns)
+static int link_on(void);
+static double g_gr_v, g_gr_last, g_gr_next;   // present thread: vsync period (s), the last present target, the target for the present being made (CACurrentMediaTime base)
+static int g_gr_extra, g_gr_trial, g_gr_hist[60], g_gr_hn; static double g_gr_hold_s = 4, g_gr_since;
+static uint64_t g_gr_late, g_gr_ups, g_gr_downs, g_gr_n, g_gr_phase;
+static _Atomic uint64_t g_gr_v_ns, g_gr_anchor_ns, g_gr_hold_ns, g_gr_iv_ns;   // read by the game thread
+static int grid_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PRESENT_GRID"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 0; } return v; }
+static int grid_on(void) { return grid_mode() && !link_on(); }
+static double grid_vsync(void) {
+    if (!g_gr_v) { const char *e = getenv("DM_DISPLAY_HZ"); int hz = e ? atoi(e) : 0; const char *src = "DM_DISPLAY_HZ";
+#if TARGET_OS_OSX
+        if (!hz) { __block int w = 0; dispatch_sync(dispatch_get_main_queue(), ^{   // the window's own screen (a second or virtual display may run at another rate than the main one)
+            NSScreen *sc = NSApp.windows.firstObject.screen;
+            if (sc) w = (int)sc.maximumFramesPerSecond; }); hz = w; src = "the window's screen"; }
+#endif
+        if (!hz) { hz = mtl_display_hz(); src = "main display mode"; }
+        if (hz < 24 || hz > 480) hz = 60; g_gr_v = 1.0 / hz;
+        MLOG("present grid: %d Hz display, every frame presented at a deadline on whole vsyncs (%s)", hz, src); atomic_store(&g_gr_v_ns, (uint64_t)(g_gr_v * 1e9 + 0.5)); }
+    return g_gr_v;
+}
+static double grid_target(double period, uint64_t ticket, double now) {
+    double v = grid_vsync();
+    // Phase: the newest presentedTime read back is a real vsync of the display. Only the sub-vsync part of its offset from the target asked for that frame moves the grid:
+    // a frame shown whole vsyncs after its target is latency, and chasing it would push every later target out (the drawables stay held and the GPU queue waits for them)
+    static double tgt[PRING]; double ph = 0;
+    for (uint64_t k = ticket - 1; k > 0 && k + 8 >= ticket; k--) { double t = mtl_presented_time(k); if (t > 0) { if (tgt[k % PRING] > 0) { ph = fmod(t - tgt[k % PRING], v); if (ph < 0) ph += v; if (ph > v / 2) ph -= v; } break; } }
+    int n = (int)floor(period / v + 0.5); if (n < 1) n = 1;
+    int cap = (int)floor(1.0 / 30 / v + 0.01); if (cap < n) cap = n; if (n + g_gr_extra > cap) g_gr_extra = cap - n;
+    n += g_gr_extra; atomic_store(&g_gr_hold_ns, (uint64_t)(n * v * 1e9 + 0.5));
+    double margin = v + 0.002, want = g_gr_last > 0 ? g_gr_last + n * v : now + margin;   // one vsync to take the drawable and encode the copy after the wake, 2 ms to spare
+    if (fabs(ph) > 0.25 * v && g_gr_last > 0) { want += ph; g_gr_phase++; }
+    if (want > now + n * v + margin) want = now + margin;   // never more than one hold ahead: a drawable scheduled further out stays held, and the queue's drawable wait stalls the game's GPU work behind it
+    int missed = 0; if (want < now + margin) { missed = (int)ceil((now + margin - want) / v); want += missed * v; }
+    // A missed slot moves the grid's phase one vsync later; jitter is absorbed by that once, while frames that keep taking longer than the hold miss again and again
+    int late = missed > 0 && missed <= 3;   // a longer gap is a load or a stall, not the rate
+    g_gr_late += late; g_gr_n++; g_gr_since += n * v;
+    g_gr_hist[g_gr_hn++ % 60] = late; int recent = 0; for (int i = 0; i < 60; i++) recent += g_gr_hist[i];
+    if (recent >= 4 && n < cap) { g_gr_extra++; g_gr_ups++; memset(g_gr_hist, 0, sizeof g_gr_hist); g_gr_since = 0;
+        if (g_gr_trial) { g_gr_hold_s = fmin(g_gr_hold_s * 2, 32); g_gr_trial = 0; }
+        MLOG("present grid: %d missed slots in 60 frames, hold %d → %d vsyncs (%.1f fps)", recent, n, n + 1, 1.0 / ((n + 1) * v)); }
+    else if (g_gr_extra > 0 && !g_gr_trial && recent == 0 && g_gr_since >= g_gr_hold_s) { g_gr_extra--; g_gr_downs++; g_gr_trial = 60; g_gr_since = 0;
+        MLOG("present grid: trial hold %d → %d vsyncs", n, n - 1); }
+    else if (g_gr_trial && !--g_gr_trial) g_gr_hold_s = 4;
+    if (g_gr_last > 0) atomic_store(&g_gr_iv_ns, (uint64_t)((want - g_gr_last) * 1e9 + 0.5));
+    g_gr_last = want; tgt[ticket % PRING] = want; atomic_store(&g_gr_anchor_ns, (uint64_t)(want * 1e9));
+    if (g_gr_n % 600 == 0) MLOG("present grid up to present %llu: hold %d vsyncs (%.2f ms), missed slots %llu, phase moves %llu, holds up %llu / down %llu", (unsigned long long)ticket, n, n * v * 1e3,
+                                (unsigned long long)g_gr_late, (unsigned long long)g_gr_phase, (unsigned long long)g_gr_ups, (unsigned long long)g_gr_downs);
+    return want;
+}
+// Game thread, once per frame before its work: the vsync to start on, on the same grid every hold (0 = no grid). Late by up to one hold: go at once in phase; more: restart from now
+uint64_t mtl_grid_wake_ns(void) {
+    uint64_t v = atomic_load(&g_gr_v_ns), h = atomic_load(&g_gr_hold_ns), a = atomic_load(&g_gr_anchor_ns);
+    if (!grid_on() || !v || !h || !a) return 0;
+    static uint64_t last; uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), w = last ? last + h : now;
+    if (w + h < now) w = now;
+    int64_t d = (int64_t)(w - a); w = a + (uint64_t)((d >= 0 ? (d + (int64_t)v / 2) / (int64_t)v : -((-d + (int64_t)v / 2) / (int64_t)v)) * (int64_t)v);
+    last = w; return w;
+}
+uint64_t mtl_grid_iv_ns(void) { return grid_on() ? atomic_load(&g_gr_iv_ns) : 0; }   // the last scheduled on-screen interval (whole vsyncs), the game's time step
 static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
@@ -7434,6 +7503,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     }];
     id<MTL4CommandBuffer> buffers[] = {cb};
     res_commit();   // the MetalFX upscale may have added its output / scratch textures while encoding this present
+    double grid_ts = target_ts == 0 ? g_gr_next : 0; g_gr_next = 0;   // set by the present thread just before (present grid)
     pthread_mutex_lock(&g_pq_mu); g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
     [g_q4 commit:buffers count:1 options:o];
     if (target_ts > 0) {
@@ -7465,6 +7535,8 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     // Only for periods of 60 fps or longer: a shorter one need not be whole vsyncs (90 fps on a fixed 120 Hz display), where the minimum rounds every frame up to 2 vsyncs (60 fps);
     // the game's own frame limiter paces those rates
     if (target_ts > 0) [dr present];
+    else if (grid_ts > 0 && grid_mode() == 2) [dr present];   // DM_PRESENT_GRID=2: same just-in-time wake, plain present (A/B of presentAtTime)
+    else if (grid_ts > 0) [dr presentAtTime:grid_ts - fmin(0.001, 0.1 * g_gr_v)];   // a fixed-rate display shows it at the first vsync after that time: the grid target
     else if (period > 1.0 / 61) [dr presentAfterMinimumDuration:period]; else [dr present];
 #endif
     (void)frame;
@@ -7477,7 +7549,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 // Swapchain texture return: before AcquireTexture gets a texture it waits for the ticket of that texture's previous present to be processed (mtl_present_wait), after which the commands the game draws into it
 // are necessarily ordered after that blit on the GPU queue.
 #define PQ 8
-typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val; } pq_item;   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev
+typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val, fence; } pq_item;   // fence: the last main submit before this present (the grid waits for it)   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev
 // External producer (the Vulkan layer, dm/gfx/vk) renders on its own queue and signals this event when a frame's rendering is done: the present of that frame waits for the value on g_q4
 static id<MTLSharedEvent> g_ext_ev;
 static void ext_wait(uint64_t v) { if (v && g_ext_ev) [g_q4 waitForEvent:g_ext_ev value:v]; }
@@ -7610,6 +7682,13 @@ static void *present_main(void *arg) {
         pthread_mutex_unlock(&g_pq_mu);
         int submitted;
         ext_wait(it.ev_val);
+        if (it.period > 0 && grid_on()) {   // grid: choose the deadline once the frame is rendered, then sleep until one vsync before it and only then take the drawable,
+            // so no drawable is held ahead (held drawables block nextDrawable, and waitForDrawable on the shared queue stalls the main work behind them)
+            if (it.fence) mtl_wait(it.fence, 100000000ull);
+            double now = CACurrentMediaTime(), ts = grid_target(it.period, ticket, now), wake = ts - g_gr_v - 0.0005;
+            if (wake > now) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); mach_wait_until(mach_absolute_time() + (uint64_t)((wake - now) * 1e9) * tb.denom / tb.numer); }
+            g_gr_next = ts;
+        }
         @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, nil, 0); }
         pthread_mutex_lock(&g_pq_mu); g_classic_busy = 0; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
         if (!submitted) {
@@ -7656,7 +7735,7 @@ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4]
     }
     pthread_mutex_lock(&g_pq_mu);
     while (g_pq_in - g_pq_done >= PQ) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // Wait only when the queue is full; normally AcquireTexture blocks first
-    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val};
+    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val, g_fence};
     if (crop) memcpy(it->crop, crop, sizeof it->crop);   // The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
     uint64_t tk = ++g_pq_in;
     pthread_cond_broadcast(&g_pq_cv);

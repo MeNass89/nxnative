@@ -1133,8 +1133,9 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         static uint64_t rt_period; uint64_t period = present_period(o);
         if (period && rt_period != period) { rt_period = period; set_time_constraint(period); }
         rt_comp_tick(period);
-        uint64_t p0 = now_ns();
+        uint64_t p0 = now_ns(), gw;
         if (mtl_link_active()) { if (!mtl_link_wait_tick(present_itv(o), period ? 2 * period : 33333333ull) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK: pacing fully follows the display link (wait for the present interval's display-link ticks when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
+        else if ((gw = mtl_grid_wake_ns())) sleep_until_ns(gw);   // present grid (nvn_mtl.m): start each frame on a vsync of the grid, one hold after the last, so frames finish and are handed over evenly
         else if (wait) sleep_until_ns(at);
         pace_ns = now_ns() - p0;
     } else {   // DM_DETCLOCK_PACE=1 (used by the screenshot gate): while the guest clock advances per frame, each frame's wall clock is no shorter than one step -- frame count and in-game time are deterministic, and the background loading thread has at least one step of wall clock available per frame;
@@ -1460,7 +1461,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     // within 4 % of it (an even step while the rate holds), at most 1/30 s (the game's own step; loads and stalls)
     if (dm_fps_state && g_hz > 0) {
         static uint64_t prev; uint64_t t = now_ns();
-        if (prev) { double dt = (t - prev) / 1e9, p = 1.0 / g_hz; if (dt > p * 0.96 && dt < p * 1.04) dt = p; if (dt > 1.0 / 30) dt = 1.0 / 30; float f = (float)dt; memcpy(dm_fps_state + 0x38, &f, sizeof f); }
+        // present grid: the step is the scheduled on-screen interval (whole vsyncs), so the world moves by exactly what the screen shows
+        if (prev) { double dt = (t - prev) / 1e9, p = 1.0 / g_hz; uint64_t giv = mtl_grid_iv_ns(); if (giv) dt = giv / 1e9; else if (dt > p * 0.96 && dt < p * 1.04) dt = p; if (dt > 1.0 / 30) dt = 1.0 / 30; float f = (float)dt; memcpy(dm_fps_state + 0x38, &f, sizeof f); }
         prev = t;
     }
     {
