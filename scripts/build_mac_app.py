@@ -40,7 +40,8 @@ def build(nsp_dir, out, glyphs):
                    (profile / 'game.tsv', 'the game profile in this repository')):
         if not p.exists(): raise SystemExit(f'missing {p}: {why}')
     print('[1/5] host')
-    run(['make', '-C', REPO / 'dm' / 'host', '-j8', f'GAME={TITLE}'], stdout=subprocess.DEVNULL)
+    r = subprocess.run(['make', '-C', str(REPO / 'dm' / 'host'), '-j8', f'GAME={TITLE}'], capture_output=True, text=True)   # compiler warnings only shown when the build fails
+    if r.returncode: raise SystemExit(f'host build failed:\n{(r.stdout + r.stderr)[-3000:]}')
     print('[2/5] rewritten mains (1080p / 1440p / 4K × 60 / 90 / 120)')
     rewriter = REPO / 'dm' / 'tools' / 'patch_nso.py'
     for res, fps in MODES:
