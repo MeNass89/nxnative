@@ -1,6 +1,6 @@
 # nxnative
 
-Play your own Nintendo Switch games natively on iPhone and iPad. Bring your game (its NSP files) and your `prod.keys`; one script turns them into an IPA that you sideload.
+Play your own Nintendo Switch games natively on iPhone and iPad, and Dark Souls Remastered on the Mac. Bring your game (its NSP files) and your `prod.keys`; one script turns them into an IPA that you sideload (or, for Dark Souls Remastered, a Mac app).
 
 It is not an emulator: the game's own code runs directly on the Apple chip, with Switch graphics rebuilt on Metal. Nothing from any game is in this repository, and the project is not affiliated with Nintendo or any game publisher.
 
@@ -49,6 +49,14 @@ All of these are tested on an iPhone and playable:
 | ![Fire Emblem: Three Houses](docs/images/fire-emblem-three-houses.jpg)<br>Fire Emblem: Three Houses | ![Super Mario Galaxy](docs/images/super-mario-galaxy.jpg)<br>Super Mario Galaxy |
 | ![The Legend of Zelda: Tears of the Kingdom](docs/images/zelda-tears-of-the-kingdom.jpg)<br>The Legend of Zelda: Tears of the Kingdom | ![Monster Hunter Rise](docs/images/monster-hunter-rise.jpg)<br>Monster Hunter Rise |
 
+On the Mac (Apple silicon, macOS 26 or later):
+
+| Game | App | Notes |
+|---|---|---|
+| Dark&nbsp;Souls:&nbsp;Remastered | ~6&nbsp;GB | Update 1.0.3. 1080p / 1440p / 4K at 60 / 90 / 120 fps (30 fps and 1080p on Switch), mods, game controllers. See [Mac app](#mac-app-dark-souls-remastered) |
+
+![Dark Souls Remastered on the Mac](docs/images/dark-souls-remastered.jpg)
+
 Needs iOS / iPadOS 26 or later on an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later: the games' textures are BC-compressed, and older iPhones can't read that format. Other games aren't supported yet. For them the script writes a survey and still tries its best to pack an IPA, guessing the game's settings; such an IPA may not start.
 
 ## Pack an IPA
@@ -80,6 +88,37 @@ The IPA appears in the same folder (here `~/Games/MarioWonder/SMBWMobile.ipa`). 
 
 **4. Install** the IPA with your sideloading tool (AltStore, Sideloadly, LiveContainer, …). The app gets the game's name, icon and version (the update's version, for example 1.2.1 for Mario Wonder; the base game's when there is no update).
 
+## Mac app (Dark Souls Remastered)
+
+**1.** Get nxnative and its tools as in [Pack an IPA](#pack-an-ipa), step 1. The scripts need Python 3.12 or later (`brew install python@3.12`, then use `python3.12` below).
+
+**2.** Put the base game and the 1.0.3 update in one folder:
+
+```
+~/Games/DarkSouls/
+  DARK SOULS REMASTERED [01004AB00A260000][v0].nsp
+  DARK SOULS REMASTERED [01004AB00A260800][v196608].nsp
+```
+
+**3.** Extract and prepare the game (rewritten code, Metal shaders), then build the app:
+
+```
+python3.12 scripts/build_ipa_from_nsp.py ~/Games/DarkSouls -k ~/keys/prod.keys
+python3.12 scripts/build_mac_app.py ~/Games/DarkSouls
+```
+
+The first script also writes an IPA, not tested on iPhone. The second writes `~/Applications/Dark Souls Remastered.app` (`-o` for another path); on APFS it clones the game files instead of copying them.
+
+**4.** Open the app. Its window sets everything before you press **Play**:
+
+- **Graphics:** resolution 1080p, 1440p or 4K, frame rate 60, 90 or 120 (above 60 needs a 120 Hz display), full screen, performance overlay. In full screen the picture is upscaled to the display with MetalFX.
+- **Controls:** game controllers (Xbox, PlayStation, Switch Pro) work as they are; the keyboard layout is listed in the app.
+- **Audio:** volume.
+- **Mods:** add a mod folder or zip whose files use the game's own paths (for example `msg/ENGLISH/menu.msgbnd.dcx`, as in PC mods); the app layers it over the game data, nothing in the game files is changed. Several mods are applied in the order shown.
+- **Saves:** back up and restore. Saves are in `~/Library/Application Support/nxnative/DarkSoulsRemastered/save`, outside the app, so rebuilding the app keeps them.
+
+In game, **Command-F** toggles full screen and **Command-Q** quits. **Short stutters** the first time you reach an area are normal: the app prepares its graphics once and remembers them.
+
 ## Play
 
 **Touch controls.** Tap **2D** / **3D** at the top to switch layouts; the app remembers your choice. Wonder, Engage, Dread, 13 Sentinels and Link's Awakening start in 2D, the other games in 3D. In Super Mario Galaxy, touches outside the controls move the pointer.
@@ -97,6 +136,8 @@ A connected game controller hides the touch controls and keeps every button.
 - Fire Emblem Engage: after switching away from the app and back, some sounds may stay silent until you restart it.
 - Fire Emblem: Three Houses: small square patches on the ground where decals land.
 - Super Mario Galaxy: effects drawn as points or lines come out one pixel wide.
+- Dark Souls Remastered (Mac): 4K at 120 fps is limited by the GPU (about 105 fps on an M4 Pro); 1440p holds 120 fps.
+- Dark Souls Remastered (Mac): rarely, after Continue the loading screen does not end because the confirm press arrived before the menu accepted it. Press the confirm button again and the game loads.
 
 ## For developers
 
