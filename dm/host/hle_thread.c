@@ -632,8 +632,21 @@ static void sleep_precise(uint64_t dl) {
         struct timespec ts = {(time_t)(s / 1000000000u), (long)(s % 1000000000u)}; nanosleep(&ts, 0);
     }
 }
+// DM_TIMEOUT_LOG=1: log each guest wait of 1 ms or more that ends in a timeout (thread, timeout, the first game return addresses on its frame chain)
+static void timeout_log(int num, int64_t ns, const uint64_t *regs, uint64_t fp) {
+    char b[256]; size_t o = 0; thr_t *me = pthread_getspecific(g_keythr);
+    for (int i = 0; i < 6 && fp && o < sizeof b; i++) {
+        uint64_t nfp = ((uint64_t *)fp)[0], lr = ((uint64_t *)fp)[1]; module_t *m = module_of((void *)lr);
+        if (m) o += (size_t)snprintf(b + o, sizeof b - o, " %s+%#llx", m->name, (unsigned long long)(lr - (uint64_t)m->base));
+        if (nfp <= fp) break; fp = nfp;
+    }
+    LOG("guest wait timed out: thread %#x svc %#x timeout %.1f ms lr=%#llx chain%s", me ? me->handle : 0, num, ns / 1e6, (unsigned long long)regs[30], b);
+}
 int svc_thread(int num, uint64_t *regs) {
+    static int tlog = -1; if (tlog < 0) tlog = getenv("DM_TIMEOUT_LOG") != NULL;
+    int64_t tns = tlog ? (int64_t)(num == 0x1C || num == 0x18 || num == 0x34 ? regs[3] : 0) : 0; uint64_t tfp = regs[29];
     int r = svc_thread_impl(num, regs);
+    if (tns >= 1000000 && regs[0] == (uint64_t)R_TIMEOUT) timeout_log(num, tns, regs, tfp);
     thr_t *me = pthread_getspecific(g_keythr);
     static int on = -1; if (on < 0) { const char *e = getenv("DM_PREEMPT"); on = e ? atoi(e) != 0 : DM_GAME_CORE_PREEMPT; }
     // Not only "whom did this SVC wake": when a higher-priority thread of the same core is already running (busy, not waiting, at the time of the signal), on hardware the calling thread does not get the CPU at all.
