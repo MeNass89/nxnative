@@ -80,7 +80,9 @@ CUTS = {
     (0xe7678, '02106f1e', 'docked scale of the base resolution'), (0xfba7c, '01106f1e', 'docked scale of the base resolution'),
     (0xfbd24, '01106f1e', 'docked scale of the base resolution'), (0x89ad20, '02106f1e', 'docked scale of the base resolution'),
     (0xfcaa8, '00106f1e', 'four-layer ambient occlusion array size'), (0x89b14c, '01106f1e', 'scaled screen size (level 2)'),
-    (0x89b1dc, '01106f1e', 'scaled screen size (level 2, second getter)'), (0x89ae6c, '01102f1e', 'scale factor of level 2'))] + [
+    (0x89b1dc, '01106f1e', 'scaled screen size (level 2, second getter)'), (0x89ae6c, '01102f1e', 'scale factor of level 2'),
+    # full and half screen size whose reciprocals go to the screen-space shaders: left at 1.5 they kept 1/1920, 1/1080, 1/960, 1/540 while the targets grew, and the effect sampled a scaled ghost of the scene
+    (0x1d4518, '00106f1e', 'screen size for the shader reciprocals'), (0x1d4564, '01106f1e', 'screen size for the shader reciprocals (half)'), (0x1d45b0, '01106f1e', 'screen size for the shader reciprocals (half, height)'))] + [
     # the 1.63 GB allocator partition carved from the main heap at start (mov w19,#0x68000000) runs out with 4K targets: 3.63 GB, with the host's DM_APP_POOL raised to match
     (0x66f4c8, '1300ad52', '1300bd52', 'main allocator partition mov w19,#0x68000000 → #0xe8000000', 'host-only'),
   ] if os.environ.get('DM_DSR_RES') in ('1440', '2160') else []),
