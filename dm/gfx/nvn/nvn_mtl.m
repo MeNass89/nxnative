@@ -7407,7 +7407,8 @@ static double grid_target(double period, uint64_t ticket, double now) {
 // Game thread, once per frame before its work: the vsync to start on, on the same grid every hold (0 = no grid). Late by up to one hold: go at once in phase; more: restart from now
 uint64_t mtl_grid_wake_ns(void) {
     uint64_t v = atomic_load(&g_gr_v_ns), h = atomic_load(&g_gr_hold_ns), a = atomic_load(&g_gr_anchor_ns);
-    if (!grid_on() || !v || !h || !a) return 0;
+    static int wake = -1; if (wake < 0) { const char *e = getenv("DM_PRESENT_GRID_WAKE"); wake = !(e && !strcmp(e, "0")); }   // DM_PRESENT_GRID_WAKE=0: the game keeps its own pacing (A/B)
+    if (!grid_on() || !wake || !v || !h || !a) return 0;
     static uint64_t last; uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), w = last ? last + h : now;
     if (w + h < now) w = now;
     int64_t d = (int64_t)(w - a); w = a + (uint64_t)((d >= 0 ? (d + (int64_t)v / 2) / (int64_t)v : -((-d + (int64_t)v / 2) / (int64_t)v)) * (int64_t)v);
