@@ -124,7 +124,14 @@ static OSStatus au_render(void *ctx, AudioUnitRenderActionFlags *f, const AudioT
         if (++a->st_calls % 2000 == 0) { uint64_t un = atomic_load(&a->under_n), ubb = atomic_load(&a->under_b);
             LOG("audio #%d device callbacks %llu: %u–%u frames each, %.1f blocks queued on average at callback; in these 2000, %llu underruns, %.1f ms zero-padded", a->id, (unsigned long long)a->st_calls, a->st_fmin, a->st_fmax, a->st_qsum / 2000.0,
                 (unsigned long long)(un - a->st_u0), (ubb - a->st_ub0) / (2.0 * a->ch) / (RATE / 1000.0)); a->st_fmin = ~0u; a->st_fmax = 0; a->st_qsum = 0; a->st_u0 = un; a->st_ub0 = ubb; } }
-    pull(a, bl->mBuffers[0].mData, bl->mBuffers[0].mDataByteSize);
+    if (a->ch == 6) {   // 5.1 from the game (FL FR C LFE SL SR) played on stereo: the device took only FL / FR, dropping the centre (voices, near sounds) and the surrounds -- a distant, muffled mix.
+        // ITU downmix L = FL + 0.707 C + 0.707 SL, R = FR + 0.707 C + 0.707 SR (LFE left out, as in the standard stereo fold-down), saturated
+        static int16_t m[8192 * 6]; int16_t *o = bl->mBuffers[0].mData; UInt32 n = bl->mBuffers[0].mDataByteSize / 4; if (n > 8192) n = 8192;
+        pull(a, (uint8_t *)m, n * 12);
+        for (UInt32 i = 0; i < n; i++) { const int16_t *x = m + i * 6; int c = (x[2] * 181 + 128) >> 8;
+            int l = x[0] + c + ((x[4] * 181 + 128) >> 8), r = x[1] + c + ((x[5] * 181 + 128) >> 8);
+            o[2 * i] = (int16_t)(l > 32767 ? 32767 : l < -32768 ? -32768 : l); o[2 * i + 1] = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r); }
+    } else pull(a, bl->mBuffers[0].mData, bl->mBuffers[0].mDataByteSize);
     { static int mute = -1; if (mute < 0) { const char *e = getenv("DM_AUDIO_MUTE"); mute = e && atoi(e); }   // diagnostic: the whole real-output path (AudioUnit callback pacing, background take-over) but with the output silenced (lifecycle tests on the Mac without noise)
       if (mute) memset(bl->mBuffers[0].mData, 0, bl->mBuffers[0].mDataByteSize); }
     { static int vol = -1; if (vol < 0) { const char *e = getenv("DM_VOLUME"); vol = e ? atoi(e) : 100; if (vol < 0) vol = 0; if (vol > 100) vol = 100; }   // master volume in percent (the player's launcher setting; 100 = untouched)
@@ -143,8 +150,8 @@ static OSStatus au_create(aout *a) {
     a->au = NULL; if (!c || AudioComponentInstanceNew(c, &a->au)) { a->au = NULL; return -1; }
     AudioStreamBasicDescription f = {.mSampleRate = RATE, .mFormatID = kAudioFormatLinearPCM,
                                      .mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,
-                                     .mBytesPerPacket = 2u * a->ch, .mFramesPerPacket = 1, .mBytesPerFrame = 2u * a->ch,
-                                     .mChannelsPerFrame = (UInt32)a->ch, .mBitsPerChannel = 16};
+                                     .mBytesPerPacket = 2u * (a->ch == 6 ? 2 : a->ch), .mFramesPerPacket = 1, .mBytesPerFrame = 2u * (a->ch == 6 ? 2 : a->ch),
+                                     .mChannelsPerFrame = (UInt32)(a->ch == 6 ? 2 : a->ch), .mBitsPerChannel = 16};   // 5.1 is folded down to stereo in au_render
     AURenderCallbackStruct cb = {au_render, a};
 #if !TARGET_OS_IPHONE
     { const char *e = getenv("DM_DBG_AU_FRAMES"); if (e) {   // diagnostic: on the Mac, make the sound card callback ask N frames each time (1024 = the iOS default, reproduces the crackling)
