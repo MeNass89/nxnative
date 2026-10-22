@@ -7359,6 +7359,10 @@ static uint64_t g_gr_late, g_gr_ups, g_gr_downs, g_gr_n, g_gr_phase;
 static _Atomic uint64_t g_gr_v_ns, g_gr_anchor_ns, g_gr_hold_ns, g_gr_iv_ns;   // read by the game thread
 static int grid_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PRESENT_GRID"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 0; } return v; }
 static int grid_on(void) { return grid_mode() && !link_on(); }
+// DM_PRESENT_MIN_VSYNC=1: a period shorter than 1/61 s that is a whole number of the window screen's vsyncs (120 fps on a 120 Hz panel) also gets its minimum on-screen
+// duration (0.5 ms under the period, so vsync jitter never rounds it up a vsync). Without it, classic present at 120 handed each frame over as soon as its work ended, on a
+// wall-clock beat not locked to the display: two frames in one vsync, the system discards the earlier one (player log 22/10: 36-40 discarded per 300, on-screen p99 8.33 ms)
+static int min_vsync_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PRESENT_MIN_VSYNC"); v = e && atoi(e) > 0; if (v) MLOG("present: minimum on-screen duration for whole-vsync periods under 1/61 s (DM_PRESENT_MIN_VSYNC)"); } return v; }
 static double grid_vsync(void) {
     if (!g_gr_v) { const char *e = getenv("DM_DISPLAY_HZ"); int hz = e ? atoi(e) : 0; const char *src = "DM_DISPLAY_HZ";
 #if TARGET_OS_OSX
@@ -7537,7 +7541,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (target_ts > 0) [dr present];
     else if (grid_ts > 0 && grid_mode() == 2) [dr present];   // DM_PRESENT_GRID=2: same just-in-time wake, plain present (A/B of presentAtTime)
     else if (grid_ts > 0) [dr presentAtTime:grid_ts - fmin(0.001, 0.1 * g_gr_v)];   // a fixed-rate display shows it at the first vsync after that time: the grid target
-    else if (period > 1.0 / 61) [dr presentAfterMinimumDuration:period]; else [dr present];
+    else if (period > 1.0 / 61) [dr presentAfterMinimumDuration:period];
+    else if (min_vsync_on() && period >= 0.98 * grid_vsync() && fabs(period / grid_vsync() - floor(period / grid_vsync() + 0.5)) < 0.05) [dr presentAfterMinimumDuration:period - 0.0005];
+    else [dr present];
 #endif
     (void)frame;
     return 1;
