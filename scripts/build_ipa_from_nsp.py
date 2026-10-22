@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Unsigned IPA straight from the NSPs: identify the game (title ID → game profile dm/games/<id>/) → extract (nx_extract) → rewrite the code modules (patch_nso.py)
-#   → (profiles with shader_glslc_capture: capture the shaders the game compiles at run time, by booting it in the Mac host for a few seconds) → split out the shaders and check them against the profile's tables (shader_split.py)
+#   → (profiles with shader_glslc_capture: extract packaged GLSLC outputs with glslc_extract, or capture run-time outputs by booting in the Mac host) → split out the shaders and check them against the profile's tables (shader_split.py)
 #   (a Vulkan game with shader_vk_capture, Super Mario Galaxy, boots the same way to capture the SPIR-V shaders it generates)
 #   → iOS shader libraries (dmsh_build.py) → build_ipa.sh. A Vulkan game (profile key graphics vulkan: Hades) skips the NVN shader steps: vk_shaders.py translates its SPIR-V shaders instead. A game with no matching profile is surveyed (<NSP folder>/<title ID>_survey/survey.md), then gets a provisional profile guessed from
 #   the survey (<NSP folder>/<title ID>_build/profile/<title ID>/, outside the repository, found through DM_GAMES_DIR) and a best-effort IPA that may not boot; SURVEY_ONLY / --survey-only stops after the survey.
@@ -707,6 +707,30 @@ def host_stopped(log, rc, secs):   # a capture run whose host stopped by itself 
              + ''.join(collections.deque(open(log, errors='replace'), maxlen=12)).rstrip('\n'))
 
 
+def extract_glslc(py, repo, dirs, env, logs, g):
+    """Fill the same glslc_capture folders as the boot capture, from packaged GLSLC outputs. Never boots the game.
+    glslc_extract selects the archive format; each shader version is extracted and checked before its folder is replaced."""
+    kind = g.get('glslc_extract')
+    if kind != 'bhd5': raise BuildError(f'unsupported glslc_extract: {kind}')
+    want = glslc_wanted(g)
+    PROG.stage('GLSLC extraction')
+    for ver, d in dirs.items():
+        out = d / 'glslc_capture'
+        got = glslc_done(out)
+        if (got >= want if want else got):
+            say(f'reusing the extracted GLSLC outputs: {out}'); continue
+        PROG.set(step=ver)
+        cap = d / 'glslc_capture.partial'; rmtree(cap)
+        run([py, repo / 'dm/tools/dsr_glslc.py', d / 'RomFS', cap], logs / f'glslc_extract_{ver}.log', env=env)
+        got = glslc_done(cap)
+        if not got or (want and not got >= want):
+            raise BuildError(f'extracted only {len(got)} GLSLC outputs for {ver}'
+                             + (f', the profile needs {len(want)}, {len(want - got)} missing' if want else ''))
+        swap_in(cap, out)
+        say(f'{len(got)} GLSLC outputs extracted to {out}')
+    PROG.end()
+
+
 def capture_glslc(repo, dirs, pkg_ver, patched, work, env, logs, g):
     """Profiles with shader_glslc_capture on (Fire Emblem: Three Houses): the game compiles some shaders at run time with its own GLSLC, so no game file holds them. The game boots in the Mac host
     (headless and silent) with DM_GLSLC_CAPTURE (dm/host/hle_glslc.c), which writes each output to <version dir>/glslc_capture, where shader_split.py reads them; the outputs are the same on every run.
@@ -1150,6 +1174,9 @@ def main(args=None):
     gb = sum({p.stat().st_size for b, u in picks.values() for p in (b, u) if p}) / 2**30 + 6   # extraction + shader cache + slack
     if free_gb(work) < gb and not all((ex / v).exists() for v in versions): raise BuildError(f'less than {gb:.0f} GB free on the volume of {work}')
     glslc = gfx == 'nvn' and g.get('shader_glslc_capture', 'off') == 'on'   # shaders the game compiles at run time, captured in the Mac host (capture_glslc)
+    glslc_extract = g.get('glslc_extract', 'off')
+    if glslc_extract not in ('off', 'bhd5'): raise BuildError(f'unsupported glslc_extract: {glslc_extract}')
+    if glslc_extract != 'off' and not glslc: raise BuildError('glslc_extract requires graphics nvn and shader_glslc_capture on')
     vkcap = gfx == 'vulkan' and g.get('shader_vk_capture', 'off') == 'on'   # SPIR-V shaders the game generates at run time, captured in the Mac host (capture_vk)
     heapck = provisional and HEAP_CHECK and not args.no_heap_check and not heap_checked(g)   # the heap check, when the game needs one (once per provisional profile: it stamps the profile)
     PROG.plan(1 + len(versions) + bool(fam['dlc']) + glslc + vkcap + (5 if gfx == 'nvn' else 4))   # nx_extract, each version's extraction, the DLC, rewrite, the GLSLC / Vulkan capture, shader split + iOS shaders (or the Vulkan shaders), app build, IPA pack
@@ -1179,7 +1206,9 @@ def main(args=None):
         g = refine_after_rewrite(g, game, patched)
         if heapck and pg.heap_check_needed(game / 'ExeFS'):
             PROG.add(1); g = heap_check(repo, game, patched, work, env, logs, g)
-    if glslc: capture_glslc(repo, {v: dirs[v] for v in need}, pkg_ver, patched, work, env, logs, g)
+    if glslc:
+        if glslc_extract != 'off': extract_glslc(py, repo, {v: dirs[v] for v in need}, env, logs, g)
+        else: capture_glslc(repo, {v: dirs[v] for v in need}, pkg_ver, patched, work, env, logs, g)
     sh = work / 'shader'
     if gfx == 'vulkan':   # the packed version's merged RomFS holds the SPIR-V files the game loads; a capture holds those it generates
         cap = capture_vk(repo, game, patched, work, env, logs, g) if vkcap else None
