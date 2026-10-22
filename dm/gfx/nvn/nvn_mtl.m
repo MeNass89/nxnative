@@ -7254,11 +7254,25 @@ static id<MTLTexture> present_upscale(id<MTL4CommandBuffer> cb, id<MTLTexture> s
         sc = comp ? [d newSpatialScalerWithDevice:g_dev compiler:comp] : nil;
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:ow height:oh mipmapped:NO];
         td.usage = sc ? sc.outputTextureUsage | MTLTextureUsageShaderRead : MTLTextureUsageShaderRead; td.storageMode = MTLStorageModePrivate;
+        // The replaced output may still be read by a present in flight (a fullscreen transition resizes it every frame): kept alive for 4 more rebuilds
+        static __strong id<MTLTexture> old[4]; static int oi; old[oi++ & 3] = out;
         out = sc ? [g_dev newTextureWithDescriptor:td] : nil;
         if (!sc || !out) { failed = 1; MLOG("[RED] MetalFX spatial upscaler unavailable (%s): the present stretches the picture", e ? e.localizedDescription.UTF8String : "scaler or texture creation failed"); return nil; }
         res_add(out); iw = src.width; ih = src.height; ipf = src.pixelFormat;
         MLOG("present: MetalFX spatial upscaling %lux%lu -> %lux%lu", (unsigned long)iw, (unsigned long)ih, (unsigned long)ow, (unsigned long)oh);
     }
+    // Metal 4 tracks no hazards: the scaler must not read the game picture before the frame's passes finish, nor write `out` while the previous present still reads it
+    // (purple patches and tearing in fullscreen). A 1-pixel copy behind a queue barrier waits for all earlier work and then updates the fence the scaler waits on
+    static __strong id<MTLFence> fence; static __strong id<MTLTexture> px;
+    if (!fence) fence = [g_dev newFence];
+    if (!px || px.pixelFormat != src.pixelFormat) { MTLTextureDescriptor *pd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:1 height:1 mipmapped:NO];
+        pd.storageMode = MTLStorageModePrivate; px = [g_dev newTextureWithDescriptor:pd]; res_add(px); }
+    id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+    [ce copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(1, 1, 1) toTexture:px destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [ce updateFence:fence afterEncoderStages:MTLStageBlit];
+    [ce endEncoding];
+    sc.fence = fence;
     sc.colorTexture = src; sc.outputTexture = out; sc.inputContentWidth = src.width; sc.inputContentHeight = src.height;
     [sc encodeToCommandBuffer:cb];
     return out;
