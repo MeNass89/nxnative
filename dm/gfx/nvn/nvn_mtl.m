@@ -674,9 +674,10 @@ static inline void enc_r_draw_instanced(id<MTL4RenderCommandEncoder> e, MTLPrimi
 static inline void enc_r_draw_indirect(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, uint64_t gpu) { [e drawPrimitives:p indirectBuffer:gpu]; }
 static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger n, MTLIndexType t, uint64_t gpu, NSUInteger len, NSUInteger i, NSInteger bv, NSUInteger bi) { [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:gpu indexBufferLength:len instanceCount:i baseVertex:bv baseInstance:bi]; }
 static inline void enc_r_draw_indexed_indirect(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, MTLIndexType t, uint64_t gpu, NSUInteger len, uint64_t ind) { [e drawIndexedPrimitives:p indexType:t indexBuffer:gpu indexBufferLength:len indirectBuffer:ind]; }
-static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { (void)d; id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [e setArgumentTable:g_ct]; return e; }
+static void pg_c_begin(id<MTL4ComputeCommandEncoder> e), pg_c_end(id<MTL4ComputeCommandEncoder> e);
+static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { (void)d; id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [e setArgumentTable:g_ct]; pg_c_begin(e); return e; }
 static inline id<MTLComputeCommandEncoder> enc_c_begin_concurrent(id<MTLCommandBuffer> cb) { return [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]; }
-static inline void enc_c_end(id e) { m4_end(e); }
+static inline void enc_c_end(id e) { pg_c_end(e); m4_end(e); }
 static inline void enc_c_pso(id e, id<MTLComputePipelineState> p) { [e setComputePipelineState:p]; }
 static inline void enc_c_args(id e, uint64_t gpu, NSUInteger i) { (void)e; [g_ct setAddress:gpu atIndex:i]; }
 static inline void enc_c_dispatch(id e, MTLSize n, MTLSize t) { [e dispatchThreadgroups:n threadsPerThreadgroup:t]; }
@@ -950,13 +951,14 @@ uint64_t mtl_sub_commit(void) {
     // CPU-visible effects after completion: copy the op table into the callback
     int n = g_npost; post_op *ops = n ? malloc(n * sizeof *ops) : NULL;
     if (n) memcpy(ops, g_post, n * sizeof *ops);
+    void pg_commit_ext(void); pg_commit_ext();
     NSArray<dispatch_block_t> *commit_blocks = [g_commit_blocks copy];
     MTL4CommitOptions *o = [MTL4CommitOptions new];
-    [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; for (dispatch_block_t block in commit_blocks) block(); }];
     uint64_t gpu_f = atomic_load(&g_cur_frame); gpu_tag_begin(gpu_f);
     NSString *cctx = @(cctx_snap());
     seg_clk *sc = g_sclk; uint32_t seg_last = g_seg; g_sclk = NULL;
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
+        for (dispatch_block_t block in commit_blocks) block();   // Resolve counters before g_done permits ring reuse.
         gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime);
         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
@@ -1821,19 +1823,21 @@ static void pass_dims(MTL4RenderPassDescriptor *pd, NSUInteger nc, NSUInteger *w
     if (!*w) { *w = MAX(pd.renderTargetWidth, 1); *h = MAX(pd.renderTargetHeight, 1); }   // attachment-less pass (rp_begin_ex_): its explicit size
 }
 
-// ---------- DM_NVN_PASSGPU=<file>: per-pass GPU time (stage-boundary timestamp counters) ----------
+// ---------- DM_NVN_PASSGPU=<file>: per-pass GPU time (Metal 4 timestamp heaps) ----------
 // Each render pass samples 4 points (vertex start/end, fragment start/end), a compute pass 2 points; resolved after the command buffer completes and accumulated by 'index of the pass within the frame'.
 // Each line: frame idx kind gpu_ms inc_ms w h fmt0 dfmt load draws t0_ns t1_ns (kind: R render / C compute; load: L load / C clear for each color attachment + depth)
 // On TBDR passes overlap in the pipeline (the later pass's vertex stage is earlier than the end of the earlier pass's fragment stage): gpu_ms = this pass's start-to-end span (including queueing) and cannot be summed;
-// attribution uses the timeline increment inc_ms = t1 − max(t0, latest t1 of the passes completed so far); the sum of the increments of all passes = total time the GPU is busy (command buffers complete in submission order)
+// inc_ms attributes end-time extensions against the latest timestamp resolved so far, not GPU utilization; auxiliary render / copy encoders are not included.
 typedef struct { uint64_t frame, pass; int idx, kind, w, h, draws, slot; uint32_t cfmt0, dfmt; char load[12]; } pg_pass;   // pass: global pass number (same as the pass number in the DM_NVN_PASSDUMP lines, for joining the two records)
-#define PG_SLOTS 4096   // Counter sample buffer limit 32768 bytes = 4096 timestamps (measured from the error on this machine)
+#define PG_SLOTS 4096   // Timestamps per submission (including its segments)
 #define PG_RING 8
 static int g_pg = -1; static FILE *g_pg_f;
-static id<MTLCounterSampleBuffer> g_pg_buf[PG_RING]; static int g_pg_b; static uint32_t g_pg_used;
+static uint64_t g_pg_hz;
+static id<MTL4CounterHeap> g_pg_buf[PG_RING]; static int g_pg_b, g_pg_busy[PG_RING]; static uint32_t g_pg_used;
 static pg_pass *g_pg_pass; static int g_pg_np, g_pg_cap, g_pg_open = -1;
 static uint64_t g_pg_frame = ~0ull; static int g_pg_idx;
 static pthread_mutex_t g_pg_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pg_cv = PTHREAD_COND_INITIALIZER;
 static inline void args_dirty_all(void);
 typedef struct { double sum, last; uint64_t n; pg_pass meta; } pg_stat;
 static pg_stat g_pg_st[256]; static uint64_t g_pg_rep_frame;
@@ -1841,21 +1845,25 @@ static int pg_on(void) {
     if (g_pg >= 0) return g_pg;
     const char *e = getenv("DM_NVN_PASSGPU"); g_pg = 0;
     if (!e) return 0;
-    if (![g_dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) { MLOG("[RED] DM_NVN_PASSGPU: this device does not support counter sampling at stage boundaries"); return 0; }
-    id<MTLCounterSet> ts = nil; for (id<MTLCounterSet> c in g_dev.counterSets) if ([c.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = c;
-    if (!ts) { MLOG("[RED] DM_NVN_PASSGPU: no timestamp counter set"); return 0; }
-    MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
-    d.counterSet = ts; d.storageMode = MTLStorageModeShared; d.sampleCount = PG_SLOTS;
-    for (int i = 0; i < PG_RING; i++) { NSError *er = nil; g_pg_buf[i] = [g_dev newCounterSampleBufferWithDescriptor:d error:&er]; if (!g_pg_buf[i]) { MLOG("[RED] cannot create the counter sample buffer: %s", er.localizedDescription.UTF8String); return 0; } }
-    if (!(g_pg_f = fopen(e, "w"))) { MLOG("[RED] DM_NVN_PASSGPU cannot open %s", e); return 0; }
+    MTL4CounterHeapDescriptor *d = [MTL4CounterHeapDescriptor new];
+    d.type = MTL4CounterHeapTypeTimestamp; d.count = PG_SLOTS;
+    g_pg_hz = [g_dev queryTimestampFrequency];
+    if (!g_pg_hz) { MLOG("[RED] DM_NVN_PASSGPU: timestamp frequency is zero"); return 0; }
+    for (int i = 0; i < PG_RING; i++) { NSError *er = nil; g_pg_buf[i] = [g_dev newCounterHeapWithDescriptor:d error:&er]; if (!g_pg_buf[i]) { MLOG("[RED] DM_NVN_PASSGPU: cannot create the counter heap: %s", er.localizedDescription.UTF8String); for (int j = 0; j < i; j++) g_pg_buf[j] = nil; return 0; } }
+    if (!(g_pg_f = fopen(e, "w"))) { MLOG("[RED] DM_NVN_PASSGPU cannot open %s", e); for (int i = 0; i < PG_RING; i++) g_pg_buf[i] = nil; return 0; }
+    setvbuf(g_pg_f, NULL, _IOLBF, 0);
     fprintf(g_pg_f, "frame\tidx\tkind\tgpu_ms\tinc_ms\tw\th\tfmt0\tdfmt\tload\tdraws\tt0_ns\tt1_ns\tpass\n");
     MLOG("[passgpu] per-pass GPU timing → %s", e);
     return g_pg = 1;
 }
-static void pg_sub_begin(uint64_t fence) {   // This submission uses block fence % PG_RING of the ring; first wait for the submission that used it PG_RING submissions ago to complete
+static void pg_sub_begin(uint64_t fence) {   // Segments share a heap; reuse only after its final feedback has resolved and flushed it.
     if (!pg_on()) return;
-    if (fence > PG_RING) mtl_wait(fence - PG_RING, UINT64_MAX);
-    g_pg_b = (int)(fence % PG_RING); g_pg_used = 0; g_pg_np = 0; g_pg_open = -1;
+    g_pg_b = (int)(fence % PG_RING);
+    pthread_mutex_lock(&g_pg_mu);
+    while (g_pg_busy[g_pg_b]) pthread_cond_wait(&g_pg_cv, &g_pg_mu);
+    pthread_mutex_unlock(&g_pg_mu);
+    [g_pg_buf[g_pg_b] invalidateCounterRange:NSMakeRange(0, PG_SLOTS)];
+    g_pg_used = 0; g_pg_np = 0; g_pg_open = -1;
 }
 static pg_pass *pg_new(int kind, int nslot) {
     if (!pg_on() || g_pg_used + nslot > PG_SLOTS) return NULL;
@@ -1867,13 +1875,7 @@ static pg_pass *pg_new(int kind, int nslot) {
     return p;
 }
 static void pg_render(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
-    (void)pd; (void)nc;
-    return;
-#if 0
     pg_pass *p = pg_new(0, 4); if (!p) return;
-    MTLRenderPassSampleBufferAttachmentDescriptor *a = pd.sampleBufferAttachments[0];
-    a.sampleBuffer = g_pg_buf[g_pg_b];
-    a.startOfVertexSampleIndex = p->slot; a.endOfVertexSampleIndex = p->slot + 1; a.startOfFragmentSampleIndex = p->slot + 2; a.endOfFragmentSampleIndex = p->slot + 3;
     id<MTLTexture> t0 = nil; int k = 0;
     for (NSUInteger i = 0; i < nc && i < 8; i++) { id<MTLTexture> t = pd.colorAttachments[i].texture; if (!t) continue;
         if (!t0) t0 = t; if (k < 10) p->load[k++] = pd.colorAttachments[i].loadAction == MTLLoadActionClear ? 'C' : 'L'; }
@@ -1882,39 +1884,55 @@ static void pg_render(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
     if (!t0) t0 = dt;
     NSUInteger pw, ph; pass_dims(pd, nc, &pw, &ph);
     p->w = (int)pw; p->h = (int)ph; p->cfmt0 = t0 && t0 != dt ? (uint32_t)t0.pixelFormat : 0;
+    p->pass = g_stat_pass + 1;
     g_pg_open = g_pg_np - 1;
-#endif
+}
+static MTL4TimestampGranularity pg_granularity(void) {
+    static int precise = -1; if (precise < 0) { const char *e = getenv("DM_NVN_PASSGPU_PRECISE"); precise = e && !strcmp(e, "1"); if (precise) MLOG("DM_NVN_PASSGPU_PRECISE=1: precise timestamps may split encoders and inflate timings"); }
+    return precise ? MTL4TimestampGranularityPrecise : MTL4TimestampGranularityRelaxed;
+}
+static void pg_r_sample(id<MTL4RenderCommandEncoder> e, int end) {
+    if (g_pg_open < 0) return;
+    int slot = g_pg_pass[g_pg_open].slot;
+    [e writeTimestampWithGranularity:pg_granularity() afterStage:MTLRenderStageVertex intoHeap:g_pg_buf[g_pg_b] atIndex:slot + end];
+    [e writeTimestampWithGranularity:pg_granularity() afterStage:MTLRenderStageFragment intoHeap:g_pg_buf[g_pg_b] atIndex:slot + 2 + end];
+}
+static int g_pg_cslot = -1;
+static void pg_c_begin(id<MTL4ComputeCommandEncoder> e) {
+    pg_pass *p = pg_new(1, 2); g_pg_cslot = p ? p->slot : -1;
+    if (p) { p->draws = 0; [e writeTimestampWithGranularity:pg_granularity() intoHeap:g_pg_buf[g_pg_b] atIndex:p->slot]; }
+}
+static void pg_c_end(id<MTL4ComputeCommandEncoder> e) {
+    if (g_pg_cslot >= 0) [e writeTimestampWithGranularity:pg_granularity() intoHeap:g_pg_buf[g_pg_b] atIndex:g_pg_cslot + 1];
+    g_pg_cslot = -1;
 }
 static id<MTLComputeCommandEncoder> pg_compute(void) {
-    pg_pass *p = pg_new(1, 2);
-    ser_gate();
-    if (!p) { args_dirty_all(); return enc_c_begin(NULL); }
-    MTLComputePassDescriptor *cd = [MTLComputePassDescriptor computePassDescriptor];
-    cd.sampleBufferAttachments[0].sampleBuffer = g_pg_buf[g_pg_b];
-    cd.sampleBufferAttachments[0].startOfEncoderSampleIndex = p->slot; cd.sampleBufferAttachments[0].endOfEncoderSampleIndex = p->slot + 1;
-    p->draws = 0;
-    args_dirty_all();
-    return enc_c_begin(cd);
+    ser_gate(); args_dirty_all(); return (id)enc_c_begin(NULL);
 }
 static void pg_end_render(void) { if (g_pg_open >= 0) { g_pg_pass[g_pg_open].draws += (int)g_stat_draw; g_pg_open = -1; } }
-static void pg_commit(id<MTLCommandBuffer> cb) {   // Hand this submission's pass table to the completion callback for resolving
-    if (!g_pg || !g_pg_np) return;
+static void pg_commit(void) {   // Hand this submission's pass table to the final Metal 4 commit feedback for resolving.
+    if (g_pg != 1 || !g_pg_np) return;
     int n = g_pg_np; pg_pass *ps = malloc(n * sizeof *ps); memcpy(ps, g_pg_pass, n * sizeof *ps);
-    id<MTLCounterSampleBuffer> buf = g_pg_buf[g_pg_b]; uint32_t used = g_pg_used;
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
-        (void)c;
+    int heap = g_pg_b; id<MTL4CounterHeap> buf = g_pg_buf[heap]; uint32_t used = g_pg_used;
+    pthread_mutex_lock(&g_pg_mu); g_pg_busy[heap] = 1; pthread_mutex_unlock(&g_pg_mu);
+    [g_commit_blocks addObject:^{
         NSData *d = [buf resolveCounterRange:NSMakeRange(0, used)];
-        const MTLCounterResultTimestamp *ts = d.bytes;
+        const MTL4TimestampHeapEntry *ts = d.bytes;
         pthread_mutex_lock(&g_pg_mu);
-        for (int i = 0; d && i < n; i++) {
+        if (d.length < used * sizeof *ts) { static int once; if (!once++) MLOG("[RED] DM_NVN_PASSGPU: counter heap resolution returned incomplete data"); }
+        for (int i = 0; d.length >= used * sizeof *ts && i < n; i++) {
             pg_pass *p = &ps[i]; uint64_t a, b;
             #define OK(x) ((x) != MTLCounterErrorValue && (x) != 0)
-            if (p->kind == 0) { a = OK(ts[p->slot].timestamp) ? ts[p->slot].timestamp : ts[p->slot + 2].timestamp; b = OK(ts[p->slot + 3].timestamp) ? ts[p->slot + 3].timestamp : ts[p->slot + 1].timestamp; }
+            if (p->kind == 0) {   // Span both stages, including a pass with no fragment work.
+                a = UINT64_MAX; b = 0;
+                for (int k = 0; k < 4; k++) { uint64_t t = ts[p->slot + k].timestamp; if (!OK(t)) continue; if (k & 1) b = MAX(b, t); else a = MIN(a, t); }
+            }
             else { a = ts[p->slot].timestamp; b = ts[p->slot + 1].timestamp; }
             if (!OK(a) || !OK(b) || b < a) continue;
             #undef OK
-            static uint64_t prev_end;   // Latest end time of the passes completed so far (completion callbacks are serialized in submission order)
-            double ms = (b - a) / 1e6;   // Timestamps are in ns, same as the CPU (measured 1:1 via sampleTimestamps on this machine)
+            a = (uint64_t)((long double)a * 1e9L / g_pg_hz); b = (uint64_t)((long double)b * 1e9L / g_pg_hz);
+            static uint64_t prev_end;   // Latest end timestamp resolved so far (feedback handlers share g_pg_mu).
+            double ms = (b - a) / 1e6;
             double inc = b > prev_end ? (b - (a > prev_end ? a : prev_end)) / 1e6 : 0;
             if (b > prev_end) prev_end = b;
             fprintf(g_pg_f, "%llu\t%d\t%c\t%.4f\t%.4f\t%d\t%d\t%u\t%u\t%s\t%d\t%llu\t%llu\t%llu\n", (unsigned long long)p->frame, p->idx, p->kind ? 'C' : 'R', ms, inc,
@@ -1928,9 +1946,10 @@ static void pg_commit(id<MTLCommandBuffer> cb) {   // Hand this submission's pas
                 for (int j = 0; j < 5 && top[j] >= 0; j++) { pg_stat *t = &g_pg_st[top[j]];
                     o += snprintf(line + o, sizeof line - o, " #%d %.2f ms %dx%d fmt%u d%u %s %d draws;", top[j], t->sum / t->n, t->meta.w, t->meta.h, t->meta.cfmt0, t->meta.dfmt, t->meta.load, t->meta.draws); }
                 MLOG("[passgpu] up to frame %llu: sum of per-pass means per frame %.2f ms; top five:%s", (unsigned long long)p->frame, tot, line);
-                fflush(g_pg_f);
             }
         }
+        fflush(g_pg_f);
+        g_pg_busy[heap] = 0; pthread_cond_broadcast(&g_pg_cv);
         pthread_mutex_unlock(&g_pg_mu);
         free(ps);
     }];
@@ -2060,7 +2079,7 @@ static void rp_end(void) { if (g_enc) { AP_B;
 #ifdef NVN_RT_RANGE_TEST
     int ranged=g_rt_range_active && !g_rt_range_pending;
 #endif
-    sd_finish(); enc_r_end_pass(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
+    sd_finish(); pg_r_sample(g_enc, 1); enc_r_end_pass(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
     if (g_nubd) ubd_flush();   // the inline updates deferred in this pass, in order (see mtl_sub_update)
     if (g_nbcrt) bcrt_flush();   // blocks drawn into shadows go back into their compressed textures
 #ifdef NVN_RT_RANGE_TEST
@@ -2069,7 +2088,7 @@ static void rp_end(void) { if (g_enc) { AP_B;
     AP_E(0);
 } }
 void pg_sub_begin_ext(uint64_t fence) { pg_sub_begin(fence); }
-void pg_commit_ext(id<MTLCommandBuffer> cb) { pg_commit(cb); }
+void pg_commit_ext(void) { pg_commit(); }
 // The format an attachment is actually attached with: the view's format if the view changes the format and can be attached, otherwise the base texture's. Shared by attaching (attach) and pipeline prediction (pso_predict_rest) so both agree --
 // prediction used the base format, so for a pass written through an sRGB view (Mario's last pass) the predicted pipeline had the wrong format and the real one was compiled at the first draw (from d2r-mobile e2a0c9a9b)
 // A compressed texture as a render target (The Legend of Zelda: Breath of the Wild a 32x32 RGTC1 (BC4) texture, Tears of the Kingdom a 32x32x32 3D one drawn one depth plane per pass, both written
@@ -2332,6 +2351,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }   // the copy encoder the shadows' blocks were moved in with (bcrt_attach)
     ser_gate();
     g_enc = enc_r_begin_pass(pd);
+    pg_r_sample(g_enc, 0);
     args_dirty_all();
     g_stat_pass++;
     if (enc_label_on()) { id<MTLTexture> lt = pd.colorAttachments[0].texture ?: pd.depthAttachment.texture ?: pd.stencilAttachment.texture; g_el_w = (int)lt.width; g_el_h = (int)lt.height; g_el_draws = 0; g_el_key[0] = 0; }
