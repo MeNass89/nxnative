@@ -633,7 +633,7 @@ static void sleep_precise(uint64_t dl) {
     }
 }
 // DM_TIMEOUT_LOG=1: log each guest wait of 1 ms or more that ends in a timeout (thread, timeout, the first game return addresses on its frame chain)
-static void timeout_log(int num, int64_t ns, const uint64_t *regs, uint64_t fp) {
+__attribute__((noinline)) static void timeout_log(int num, int64_t ns, const uint64_t *regs, uint64_t fp) {   // not inlined: its buffer would otherwise grow svc_thread's frame on every guest SVC, and some game threads have little stack
     char b[256]; size_t o = 0; thr_t *me = pthread_getspecific(g_keythr);
     for (int i = 0; i < 6 && fp && o < sizeof b; i++) {
         uint64_t nfp = ((uint64_t *)fp)[0], lr = ((uint64_t *)fp)[1]; module_t *m = module_of((void *)lr);
