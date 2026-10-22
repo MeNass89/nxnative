@@ -131,12 +131,12 @@ static void dump_at(void) {
 }
 void crash_dump_now(const char *why) { fprintf(stderr, "[dm] state dump (%s): tick %u / stage %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); dump_at(); }
 // Only the first crashing thread prints its state: when several threads crash at once (Unity's job threads often do), the dumps used to interleave and the process hung in the dump without exiting.
-// Later threads stop in pause() until the process exits; the first thread re-entering (crashing again while printing, or the SIGALRM of the 15 s safety below) exits at once.
+// Later threads stop in pause() until the process exits; the first thread re-entering (crashing again while printing) exits at once, and so does any thread that receives the SIGALRM of the 15 s safety below.
 static _Atomic uintptr_t g_crash_owner;
 static void crash_gate(int sig) {
     uintptr_t me = (uintptr_t)pthread_self(), none = 0;
     if (atomic_compare_exchange_strong(&g_crash_owner, &none, me)) { alarm(15); return; }
-    if (none == me) _exit(128 + sig);
+    if (none == me || sig == SIGALRM) _exit(128 + sig);
     for (;;) pause();
 }
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
