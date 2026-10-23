@@ -50,7 +50,34 @@ static void on_step(ucontext_t *uc) {
     // probe.c has already pointed pc at the slot
     s->__x[9] = (uint64_t)(g_base + WARP_FN); s->__x[10] = (uint64_t)obj; s->__x[11] = 1; s->__x[12] = s->__pc; s->__pc = (uint64_t)g_stub;
 }
+// Dark Souls Remastered load hang (switch-mac-native ticket MBA-S2: about 1 bonfire warp in 15, also the first load after Continue, the loading screen never ends).
+// A race in the game itself, between its resource pump (main thread, main+0x1a97e8, every frame) and its loader thread (main+0x1a91a0) that runs the decode jobs.
+// For each load handle it pops whose read is done (state 2), the pump asks the handle "is your job still running?" twice: first inside main+0x1a892c (which completes
+// the handle, state 4, when the answer is no), then again at main+0x1a994c / main+0x1a9a64 to choose between pushing the handle back to its queue (busy) and moving on.
+// The question (vtable +0x48, main+0x19d590, shared by every load-handle class) records the answer: when it first sees the job finished it sets phase +0x50 = 2.
+// If the loader thread finishes the job between the two questions, the first says busy (no completion) and the second says done (no push-back): the handle stays in
+// state 2, in no queue, and nothing ever looks at it again. The resource that depends on it never becomes ready and the map load waits forever. Observed at every
+// captured hang: one handle in state 2, phase 2, outside every queue (4 of 4 captures, 3 different handle classes).
+// Mitigation (probe, game-specific, off with DM_DSR_PUMPFIX=0): at main+0x19d5d4, where the question has just seen the job finished, if it was asked by the pump's
+// second check (saved lr main+0x1a9958 / main+0x1a9a70) it answers busy instead (main+0x19d5c0, phase stays 1). The pump pushes the handle back, and its next pass
+// (one frame later) sees the finished job in the first check and completes it. MBA sweep: 0 hangs in 61 warps (baseline 4 in 61), the mitigation fired 9 times.
+static _Atomic uint64_t g_fix_n;
+static void on_pumpfix(ucontext_t *uc) { __typeof__(uc->uc_mcontext->__ss) *r = &uc->uc_mcontext->__ss;
+    uint64_t lr = *(uint64_t *)(r->__sp + 0x18) - (uint64_t)g_base;   // main+0x19d590 saved x29/x30 at sp+0x10
+    if (lr != 0x1a9958 && lr != 0x1a9a70) return;
+    uint8_t *h = (uint8_t *)r->__x[19];
+    uint64_t n = ++g_fix_n; if (n <= 20 || n % 100 == 0) LOG("[dsr] load race caught (#%llu): handle %p vtable main+%#llx, its job finished between the pump's two checks; pushed back (frame %llu)",
+        (unsigned long long)n, h, (unsigned long long)(*(uint64_t *)h - (uint64_t)g_base), (unsigned long long)dm_guest_frame());
+    r->__pc = (uint64_t)(g_base + 0x19d5c0);
+}
+static void dsr_pumpfix_install(void) {
+    const char *e = getenv("DM_DSR_PUMPFIX"); if (e && !atoi(e)) return;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) g_base = g_mod[i].base;
+    if (!g_base) return;
+    probe_add_fn("main", 0x19d5d4, on_pumpfix);
+}
 void dsr_warp_install(void) {
+    if (!strncmp(dm_main_build(), "df3766a2bb651a3e", 16)) dsr_pumpfix_install();   // on for this build whether or not a warp is requested
     const char *w = getenv("DM_WARP"), *fe = getenv("DM_WARP_FILE"), *st = getenv("DM_DSR_STATE");
     if (!w && !fe && !st) return;
     if (strncmp(dm_main_build(), "df3766a2bb651a3e", 16)) { LOG("[RED] [dsr] DM_WARP: main is not Dark Souls Remastered 1.0.3 (df3766a2bb651a3e), ignored"); return; }
