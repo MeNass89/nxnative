@@ -186,7 +186,8 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
     // DM_SPIN_US=n: spin up to n microseconds with G released before sleeping on the condition variable: most guest waits are hand-offs between the game's threads that end within
     // microseconds, and a sleep + wake through the kernel cost far more on the critical path of a frame. Dark Souls Remastered, 120 fps build: frame p50 8.8 -> 8.34 ms, CPU energy
-    // 4.6 -> 2.4 W. Off by default: with 30 us its first load after Continue never ended in about a quarter of boots at 120 fps (16/16 boots fine without; cause not found)
+    // 4.6 -> 2.4 W. Off by default here; the Mac launcher sets 30 for Dark Souls Remastered at 90/120 fps. The load hangs once blamed on it were a stack overflow (a1a712f) and the
+    // resource pump's race (372a08a): with both fixed, 60 warps + 20 Continue boots at 120 with 30 us, no hang (MBA M2, 23/10/2026)
     { static long spin = -1; if (spin < 0) { const char *e = getenv("DM_SPIN_US"); spin = e ? atol(e) : 0; }
       if (spin > 0 && ns != 0) { uint64_t end = now_ns() + (uint64_t)spin * 1000; pthread_mutex_unlock(&G);
           while (!__atomic_load_n(&t->woke, __ATOMIC_ACQUIRE) && now_ns() < end) __builtin_arm_yield();
