@@ -54,6 +54,7 @@ typedef struct thr {
     pthread_t pt; pthread_cond_t cv;
     // Current wait: kind 0=none 1=lock 2=condition 3=address 4=synchronization object
     int wkind, woke; uint64_t waddr, wkey; uint32_t wtag; int64_t wres;
+    int excl_core;             // DM_CORE_EXCL: core whose exclusion lock this thread holds while running guest code, -1 none
     int tmo_kind;              // wait kind the thread was in when its timed wait expired (DM_CV_TRACE: 2 = still a condition wait, 1 = already turned into a lock wait by a signal)
     _Atomic int sleeping;      // inside SleepThread's timed sleep (not runnable; used by dm_yield_to_core_peers)
     int yield_pending;         // this SVC woke a higher-priority thread pinned to this core: let it run before the SVC returns (svc_thread)
@@ -290,6 +291,65 @@ static void lock_acquire_for(thr_t *t, uint64_t addr, uint32_t tag) {
     t->wseq = ++g_wseq;                                  // The kernel inserts it anew into the lock owner's wait queue: at equal priority it goes after the existing lock waiters
 }
 
+
+// ---------- DM_CORE_EXCL: Horizon's one-thread-at-a-time per core, for threads pinned to one core ----------
+// On Horizon a core runs one thread at a time and, at equal priority, a thread keeps the core until it blocks or yields (no time slicing). Games can lean on that:
+// threads pinned to the same core never truly run in parallel. On the host every guest thread is a free pthread. DM_CORE_EXCL=<cores> (e.g. "0" or "0,2"; profile
+// key core_exclusive) gives each listed core a fair (FIFO ticket) lock: a thread whose affinity mask is exactly that core holds it while it runs guest code and HLE
+// calls, and lets it go for the whole of every SVC (blocking waits, sleeps, yields), so such threads interleave only at SVC boundaries. Multi-core threads are untouched
+typedef struct { pthread_mutex_t m; pthread_cond_t c; uint64_t next, serving; struct thr *owner; } core_excl_t;
+// A holder blocked inside host code (an HLE take-over waiting on a host primitive: no SVC, so it cannot let go) would stall its core forever; on Horizon a thread blocked
+// in the kernel leaves its core. So the waiter at the head of the queue takes the core over when the holder's host thread is not runnable (mach run state not RUNNING,
+// checked every 200 us). The old holder then simply no longer owns it: it gives nothing back at its next SVC and queues again on the way out
+static core_excl_t g_cx[4] = {{PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, 0}, {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, 0},
+                              {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, 0}, {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, 0}};
+static int g_cx_mask = -1;
+static _Atomic uint64_t g_cx_waits, g_cx_wait_ns, g_cx_long, g_cx_steals;
+static int cx_mask(void) {
+    if (g_cx_mask < 0) { const char *e = getenv("DM_CORE_EXCL"); int m = 0;
+        if (e) { for (const char *p = e; *p; p++) if (*p >= '0' && *p <= '3') m |= 1 << (*p - '0'); }
+#ifdef DM_GAME_CORE_EXCL
+        else m = DM_GAME_CORE_EXCL;
+#endif
+        g_cx_mask = m; if (m) LOG("DM_CORE_EXCL: cores %#x run one pinned guest thread at a time (released across every SVC)", m); }
+    return g_cx_mask;
+}
+static int cx_host_blocked(const thr_t *o) {   // the holder's host thread is waiting (blocked in host code), not running or runnable
+    if (!o || !o->mport) return 0;
+    thread_basic_info_data_t bi; mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(o->mport, THREAD_BASIC_INFO, (thread_info_t)&bi, &n) != KERN_SUCCESS) return 1;
+    return bi.run_state != TH_STATE_RUNNING;
+}
+static void cx_acquire(thr_t *t) {
+    if (!t || t->host_owned || t->excl_core >= 0) return;
+    int m = cx_mask(); if (!m) return;
+    int c = t->core & 3; if (t->mask != 1ull << c || !(m >> c & 1)) return;
+    core_excl_t *x = &g_cx[c]; uint64_t t0 = 0;
+    pthread_mutex_lock(&x->m);
+    uint64_t my = x->next++;
+    for (int blocked = 0;;) {
+        if (x->serving == my) {
+            if (!x->owner) break;
+            if (cx_host_blocked(x->owner)) { if (++blocked >= 2) { g_cx_steals++; x->owner->excl_core = -1; break; } } else blocked = 0;   // two checks 200 us apart
+        }
+        if (!t0) t0 = now_ns();
+        struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 200000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&x->c, &x->m, &dl);
+    }
+    x->serving++; x->owner = t; t->excl_core = c;
+    pthread_cond_broadcast(&x->c);
+    pthread_mutex_unlock(&x->m);
+    if (t0) { uint64_t d = now_ns() - t0; g_cx_waits++; g_cx_wait_ns += d; if (d > 100000000ull) g_cx_long++; }
+}
+static void cx_release(thr_t *t) {
+    if (!t || t->excl_core < 0) return;
+    core_excl_t *x = &g_cx[t->excl_core & 3];
+    pthread_mutex_lock(&x->m);
+    if (x->owner == t) { x->owner = NULL; pthread_cond_broadcast(&x->c); }
+    t->excl_core = -1;
+    pthread_mutex_unlock(&x->m);
+}
+
 // ---------- Threads ----------
 extern void dm_thread_enter(uint64_t entry, uint64_t arg, uint64_t sp);   // entry.S
 uint32_t (*dm_thread_tick_fn)(void);   // Gets the current game tick; registered when diag.c initializes (unit tests do not register it, the tick number is recorded as 0)
@@ -325,6 +385,7 @@ static void *thread_main(void *p) {
     crash_thread_init();
     guest_thread_init();
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); pthread_mutex_unlock(&G);
+    cx_acquire(t);
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // Does not return: the guest must exit through ExitThread
     die("guest thread entry returned");
 }
@@ -374,12 +435,14 @@ static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
 // called by the gate on SVC entry / exit (gate_dispatch in hle.c)
 void thr_svc_enter(uint64_t *regs, uint64_t pc) {
     thr_t *t = pthread_getspecific(g_keythr); if (!t) return;
+    cx_release(t);
     t->svc_pc = pc; atomic_store(&t->svc_regs, regs); atomic_fetch_or(&t->svc_state, 1);
     if (atomic_load_explicit(&t->qos_pending, memory_order_relaxed) && atomic_exchange(&t->qos_pending, 0)) qos_apply(t);
     if (atomic_load(&t->pause_req)) { pthread_mutex_lock(&G); if (t->pause_req && !t->paused) { t->paused = 1; pthread_cond_broadcast(&t->pcv); } pthread_mutex_unlock(&G); }
 }
 void thr_svc_leave(void) {
     thr_t *t = pthread_getspecific(g_keythr); if (!t) return;
+    cx_acquire(t);
     int in = 1; if (atomic_compare_exchange_strong(&t->svc_state, &in, 0)) { atomic_store(&t->svc_regs, NULL); return; }   // no pause requested: G is not needed (every other thread's SVC takes it)
     pthread_mutex_lock(&G);
     while (t->pause_req) { t->paused = 1; pthread_cond_broadcast(&t->pcv); pthread_cond_wait(&t->pcv, &G); }
@@ -414,7 +477,7 @@ uint32_t svc_thread_main_init(void) {
     pause_install();
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL); pthread_cond_init(&t->pcv, NULL);
-    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt); t->host_work = &dm_host_work;
+    t->excl_core = -1; t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt); t->host_work = &dm_host_work;
     pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
     pthread_setspecific(g_keythr, t);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
@@ -576,6 +639,7 @@ void svc_thread_dump(void) {
     static const char *kinds[] = {"running/not waiting", "mutex", "condvar", "address", "sync object"};
     int nh = 0; for (int i = 1; i < MAX_H; i++) nh += g_h[i].type != O_FREE;
     fprintf(stderr, "[dm] handle table use %d / %d, threads created so far %llu\n", nh, MAX_H, g_next_id - 0x51);
+    if (g_cx_mask > 0) fprintf(stderr, "[dm] DM_CORE_EXCL cores %#x: %llu contended acquires, %.1f ms waited, %llu over 100 ms, %llu taken from a holder blocked in host code\n", g_cx_mask, (unsigned long long)g_cx_waits, g_cx_wait_ns / 1e6, (unsigned long long)g_cx_long, (unsigned long long)g_cx_steals);
     fprintf(stderr, "[dm] same-core preemption yields %llu, total %.1f ms, hit the cap %llu times\n", (unsigned long long)g_preempt_n, g_preempt_ns / 1e6, (unsigned long long)g_preempt_cap);
     for (thr_t *t = g_all; t; t = t->all) {
         module_t *m = module_of((void *)t->last_lr);
@@ -730,7 +794,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     case 0x08: {  // CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
         thr_t *t = calloc(1, sizeof *t);
         pthread_cond_init(&t->cv, NULL); pthread_cond_init(&t->pcv, NULL);
-        t->entry = regs[1]; t->arg = regs[2]; t->stack_top = regs[3] & ~0xFull;
+        t->excl_core = -1; t->entry = regs[1]; t->arg = regs[2]; t->stack_top = regs[3] & ~0xFull;
         // Core -2 (IdealCoreUseProcessValue) = the process's default ideal core (0 for this game), with an affinity mask of just that core - as in the Horizon kernel. It used to be recorded as -2 and GetCurrentProcessorNumber answered -2;
         //   SMBW's font engine picks its per-core engine slot by the current core number and crashed indexing with -2 (main +0x107dbc0, SequenceBackgroundWorker thread)
         t->prio = (int)regs[4]; t->core = (int)regs[5] >= 0 ? (int)regs[5] : 0; t->mask = 1ull << t->core;
