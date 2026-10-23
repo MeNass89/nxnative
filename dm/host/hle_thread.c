@@ -54,6 +54,7 @@ typedef struct thr {
     pthread_t pt; pthread_cond_t cv;
     // Current wait: kind 0=none 1=lock 2=condition 3=address 4=synchronization object
     int wkind, woke; uint64_t waddr, wkey; uint32_t wtag; int64_t wres;
+    int tmo_kind;              // wait kind the thread was in when its timed wait expired (DM_CV_TRACE: 2 = still a condition wait, 1 = already turned into a lock wait by a signal)
     _Atomic int sleeping;      // inside SleepThread's timed sleep (not runnable; used by dm_yield_to_core_peers)
     int yield_pending;         // this SVC woke a higher-priority thread pinned to this core: let it run before the SVC returns (svc_thread)
     _Atomic int *host_work;    // points at the thread's dm_host_work (registered when the thread starts)
@@ -176,7 +177,7 @@ static int64_t block(thr_t *t, int kind, int64_t ns) {   // Boot timeline: accum
 }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
-    if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
+    if (ns == 0) { t->tmo_kind = kind; wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     struct timespec dl;
     int det_wait = ns > 0 && dm_detclock_enabled();
     uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
@@ -193,13 +194,75 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
         int rc;
         if (det_wait) {
             uint64_t now = guest_ns();
-            if (now >= guest_deadline) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
+            if (now >= guest_deadline) { t->tmo_kind = t->wkind; wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
             (void)(guest_deadline - now);
             rc = pthread_cond_wait(&t->cv, &G);
         } else rc = ns > 0 ? pthread_cond_timedwait(&t->cv, &G, &dl) : pthread_cond_wait(&t->cv, &G);
-        if (rc == ETIMEDOUT && !t->woke && (!det_wait || guest_ns() >= guest_deadline)) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
+        if (rc == ETIMEDOUT && !t->woke && (!det_wait || guest_ns() >= guest_deadline)) { t->tmo_kind = t->wkind; wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     }
     return t->wres;
+}
+
+// ---------- DM_CV_TRACE: condition-variable event ring (diagnosis of lost wake-ups) ----------
+// DM_CV_TRACE=<file>: every svc 0x1C entry/exit and 0x1D is recorded, holding G, into a 64 Ki-entry ring (a few stores per event: it must not slow frames, the races hide
+// under slow probes). The state dump writes the whole ring to <file> and prints, for each thread in a condition wait, the last events on its key
+enum { CV_WAIT = 1, CV_WOKE, CV_TMO, CV_SIG };
+typedef struct { uint64_t ns, key, lr, lr2; uint32_t handle, val; int32_t arg; uint16_t type, n, left, kbefore; } cvev_t;
+#define CV_RING 262144
+#define CV_KEYS 2048
+#define CV_KHIST 64
+// Besides the global ring, each key keeps its own last CV_KHIST events (open-addressed table): a hang is noticed a minute after the waiter fell asleep, long after the global ring wrapped
+typedef struct { uint64_t key, n; cvev_t ev[CV_KHIST]; } cvkey_t;
+static cvkey_t *g_cvk; static int g_cvk_full;
+static cvev_t *g_cvr; static uint64_t g_cvn; static const char *g_cvfile; static int g_cvon = -1;
+static inline int cv_on(void) {
+    if (g_cvon < 0) { g_cvfile = getenv("DM_CV_TRACE"); g_cvon = g_cvfile && *g_cvfile; if (g_cvon) { g_cvr = calloc(CV_RING, sizeof *g_cvr); g_cvk = calloc(CV_KEYS, sizeof *g_cvk); } if (!g_cvr || !g_cvk) g_cvon = 0; }
+    return g_cvon;
+}
+static inline void cv_rec(int type, uint32_t h, uint64_t key, uint64_t lr, uint64_t lr2, int32_t arg, uint32_t val, int n, int left, uint32_t kbefore) {   // holding G
+    cvev_t *e = &g_cvr[g_cvn++ & (CV_RING - 1)];
+    e->ns = now_ns(); e->type = (uint16_t)type; e->handle = h; e->key = key; e->lr = lr; e->lr2 = lr2; e->arg = arg; e->val = val; e->n = (uint16_t)n; e->left = (uint16_t)left; e->kbefore = (uint16_t)kbefore;
+    unsigned i = (unsigned)((key >> 2) * 0x9E3779B97F4A7C15ull >> 53) & (CV_KEYS - 1);
+    for (int probe = 0; probe < CV_KEYS; probe++, i = (i + 1) & (CV_KEYS - 1)) {
+        cvkey_t *k = &g_cvk[i];
+        if (k->key == key || !k->key) { k->key = key; k->ev[k->n++ & (CV_KHIST - 1)] = *e; return; }
+    }
+    g_cvk_full = 1;
+}
+static inline uint64_t cv_lr2(uint64_t fp) {   // return address one frame up the guest x29 chain (0 if fp is not a plausible guest stack pointer)
+    if (!fp || (fp & 7) || (fp >> 32) < 0x10 || (fp >> 32) > 0xff) return 0;
+    return ((const uint64_t *)fp)[1];
+}
+static void cv_fmt(const cvev_t *e, uint64_t t0, char *b, size_t nb) {
+    module_t *m = module_of((void *)e->lr), *m2 = module_of((void *)e->lr2); char lr[128];
+    snprintf(lr, sizeof lr, "%s+%#llx < %s+%#llx", m ? m->name : "?", (unsigned long long)(m ? e->lr - (uint64_t)m->base : e->lr), m2 ? m2->name : "?", (unsigned long long)(m2 ? e->lr2 - (uint64_t)m2->base : e->lr2));
+    double ms = ((int64_t)(e->ns - t0)) / 1e6;
+    switch (e->type) {
+    case CV_WAIT: snprintf(b, nb, "%+11.3f ms %#x 0x1C wait key %#llx key-before %u timeout %s%d ms lock-handoff woke %u lr %s", ms, e->handle, (unsigned long long)e->key, e->kbefore, e->arg < 0 ? "inf/" : "", e->arg, e->n, lr); break;
+    case CV_WOKE: snprintf(b, nb, "%+11.3f ms %#x 0x1C woke key %#llx result %#x key-now %u lr %s", ms, e->handle, (unsigned long long)e->key, e->val, e->kbefore, lr); break;
+    case CV_TMO:  snprintf(b, nb, "%+11.3f ms %#x 0x1C TIMEOUT key %#llx was kind %d key-now %u lr %s", ms, e->handle, (unsigned long long)e->key, e->arg, e->kbefore, lr); break;
+    case CV_SIG:  snprintf(b, nb, "%+11.3f ms %#x 0x1D signal key %#llx count %d key-before %u woken %u still-waiting %u lr %s", ms, e->handle, (unsigned long long)e->key, e->arg, e->kbefore, e->n, e->left, lr); break;
+    default: snprintf(b, nb, "?");
+    }
+}
+static void cv_dump(void) {
+    if (g_cvon <= 0) return;
+    uint64_t n = g_cvn, first = n > CV_RING ? n - CV_RING : 0, t0 = now_ns(); char b[320];
+    FILE *f = fopen(g_cvfile, "w");
+    if (f) { fprintf(f, "# %llu events recorded, ring holds the last %llu; times relative to the dump\n", (unsigned long long)n, (unsigned long long)(n - first));
+             for (uint64_t i = first; i < n; i++) { cv_fmt(&g_cvr[i & (CV_RING - 1)], t0, b, sizeof b); fprintf(f, "%s\n", b); }
+             for (int j = 0; j < CV_KEYS; j++) { const cvkey_t *k = &g_cvk[j]; if (!k->key) continue; uint64_t kf = k->n > CV_KHIST ? k->n - CV_KHIST : 0;
+                 fprintf(f, "## key %#llx: %llu events\n", (unsigned long long)k->key, (unsigned long long)k->n);
+                 for (uint64_t i = kf; i < k->n; i++) { cv_fmt(&k->ev[i & (CV_KHIST - 1)], t0, b, sizeof b); fprintf(f, "%s\n", b); } }
+             fclose(f); }
+    fprintf(stderr, "[dm] DM_CV_TRACE: %llu events, full ring written to %s%s\n", (unsigned long long)n, f ? g_cvfile : "(open failed)", g_cvk_full ? " (per-key table full: some keys untracked)" : "");
+    for (thr_t *t = g_all; t; t = t->all) {
+        if (t->wkind != 2) continue;
+        const cvkey_t *k = NULL; for (int i = 0; i < CV_KEYS; i++) if (g_cvk[i].key == t->wkey) { k = &g_cvk[i]; break; }
+        uint64_t kn = k ? k->n : 0, kf = kn > CV_KHIST ? kn - CV_KHIST : 0;
+        fprintf(stderr, "[dm] cv trace: thread %#x waits on key %#llx, %llu events on that key, the last %llu:\n", t->handle, (unsigned long long)t->wkey, (unsigned long long)kn, (unsigned long long)(kn - kf));
+        for (uint64_t i = kf; i < kn; i++) { cv_fmt(&k->ev[i & (CV_KHIST - 1)], t0, b, sizeof b); fprintf(stderr, "[dm]   %s\n", b); }
+    }
 }
 
 // ---------- Locks ----------
@@ -537,6 +600,7 @@ void svc_thread_dump(void) {
                         fprintf(stderr, "[dm]   %#x waited-for object, 64 bytes from %#llx: %s\n", t->handle, t->waddr & ~0xfull, hx); }
         thr_bt(t);
     }
+    cv_dump();
     // Threads created by the host itself (prefetch, Granny background, graphics present, audio, etc.): not in the guest thread table, enumerated as mach threads, the first 12 frames symbolized with dladdr
     thread_act_array_t ths; mach_msg_type_number_t nth = 0;
     if (task_threads(mach_task_self(), &ths, &nth) == KERN_SUCCESS) {
@@ -786,15 +850,19 @@ static int svc_thread_impl(int num, uint64_t *regs) {
 #define CV_TEST_HOOK()
 #endif
 #ifndef DM_TEST_CV_OLD_ORDER
+        uint32_t kb = cv_on() ? ld32(key) : 0; int lw = cv_on() && pick(1, addr) != NULL;
         st32(key, 1);
         t->wkey = key; t->waddr = addr; t->wtag = (uint32_t)regs[2];
         lock_handoff(addr); CV_TEST_HOOK();
+        if (cv_on()) cv_rec(CV_WAIT, t->handle, key, regs[30], cv_lr2(regs[29]), (int64_t)regs[3] < 0 ? -1 : (int32_t)((int64_t)regs[3] / 1000000), 0, lw, 0, kb);
 #else   // Negative control for the unit test t_condvar only: restores the pre-fix order "release the lock first, set the key after"
         lock_handoff(addr); CV_TEST_HOOK();
         st32(key, 1);
         t->wkey = key; t->waddr = addr; t->wtag = (uint32_t)regs[2];
 #endif
         int64_t r = block(t, 2, (int64_t)regs[3]);   // Timeout: the lock is not re-acquired (user mode takes it itself)
+        if (cv_on()) { if (r == R_TIMEOUT) cv_rec(CV_TMO, t->handle, key, regs[30], cv_lr2(regs[29]), t->tmo_kind, 0, 0, 0, ld32(key));
+                       else cv_rec(CV_WOKE, t->handle, key, regs[30], cv_lr2(regs[29]), 0, (uint32_t)r, 0, 0, ld32(key)); }
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
@@ -803,6 +871,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         pthread_mutex_lock(&G);
         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // In kernel order; once turned into a lock wait or woken it is no longer kind 2
         int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
+        if (cv_on()) { thr_t *me = pthread_getspecific(g_keythr); cv_rec(CV_SIG, me ? me->handle : 0, key, regs[30], cv_lr2(regs[29]), cnt, 0, n, left, ld32(key)); }
         if (!left) st32(key, 0);
         pthread_mutex_unlock(&G);
         regs[0] = 0; return 1;
