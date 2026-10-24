@@ -7798,7 +7798,9 @@ int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) {
     // A frame presented with interval N blocks the game for N vsyncs on the Switch, as the display callback holds it N ticks: games that scale their time step by the interval (BotW's VFR: interval / 2)
     // ran at double speed while they produced interval-2 frames every 60 Hz tick (iPhone log: Link sprinting with B, the interval flapping 1 ↔ 2)
     if (vsyncs < 1) vsyncs = 1;
-    const uint64_t step = g_link_mode == 3 ? (uint64_t)(vsyncs + 1) / 2 : (uint64_t)vsyncs * (g_link_mode == 2 ? 2 : 1);
+    // The game's vsyncs are at DM_PRESENT_HZ: at 120 (the 120 fps patched game) one game vsync is one tick of the 120 Hz link, not two (before: DM_PRESENT_LINK=2 held it at 60)
+    static int game_hz; if (!game_hz) { const char *e = getenv("DM_PRESENT_HZ"); game_hz = e && atoi(e) >= 90 ? 120 : 60; }
+    const uint64_t step = g_link_mode == 3 ? (uint64_t)(vsyncs + 1) / 2 : (uint64_t)vsyncs * (g_link_mode == 2 && game_hz == 60 ? 2 : 1);
     pthread_mutex_lock(&g_link_mu);
     if (g_link_tick_n >= started_tick + step) { started_tick = g_link_tick_n; pthread_mutex_unlock(&g_link_mu); return 1; }
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
