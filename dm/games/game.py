@@ -118,6 +118,8 @@ def header(g):
     if gts not in ('submission', 'segment'): sys.exit(f'{g.id}: gpu_timestamps must be submission or segment: {gts}')
     om = g.get('op_mode', 'console')   # the operation mode reported at start (hle_oe.c dm_opmode; DM_OPMODE overrides): console = docked, handheld = touch screen in use (Super Mario Galaxy's pointer)
     if om not in ('console', 'handheld'): sys.exit(f'{g.id}: op_mode must be console or handheld: {om}')
+    uic = g.get('ui_canvas', '')   # the canvas the game lays its UI out on when it renders into larger targets (nvn_mtl.m: its clip rectangles stay in canvas pixels and are scaled to the target); empty = off
+    if uic and not re.fullmatch(r'[1-9]\d*x[1-9]\d*', uic): sys.exit(f'{g.id}: ui_canvas must be WIDTHxHEIGHT: {uic}')
     api = g.get('device_api', '55.15')   # the NVN API major.minor version nvnDeviceGetInteger reports (hle_nvn.c)
     if not re.fullmatch(r'\d+\.\d+', api): sys.exit(f'{g.id}: device_api must be major.minor: {api}')
     src = f'dm/games/{g.id}' if g.dir.parent == HERE else str(g.dir)
@@ -155,6 +157,8 @@ def header(g):
          f'#define DM_GAME_RENDER_COND {int(rcd == "on")}',
          f'#define DM_GAME_TEX_DIRTY_UPLOAD {int(tdu == "on")}',
          f'#define DM_GAME_GPU_TS_SEGMENT {int(gts == "segment")}',
+         f'#define DM_GAME_UI_CANVAS_W {int(uic.split("x")[0]) if uic else 0}',
+         f'#define DM_GAME_UI_CANVAS_H {int(uic.split("x")[1]) if uic else 0}',
          f'#define DM_GAME_NVN_API_MAJOR {api.split(".")[0]}',
          f'#define DM_GAME_NVN_API_MINOR {api.split(".")[1]}',
          '']

@@ -5838,6 +5838,12 @@ frz_plain:;
     if (R.has_sc) {
         long x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y <= 0 ? 0 : R.sc.y + so, x1 = (long)R.sc.x + R.sc.w, y1 = vs != 1 ? (long)th : (long)R.sc.y + R.sc.h + so;
         if (up != 1 && 2 * x1 <= (long)tw && 2 * y1 <= (long)th) { x0 *= 2; y0 *= 2; x1 *= 2; y1 *= 2; }
+        // UI canvas (profile ui_canvas, DM_UI_CANVAS=WxH overrides): a game rendered into targets larger than the canvas it lays its UI out on keeps its clip rectangles in canvas pixels
+        // while its viewport stretches the canvas over the target (Dark Souls Remastered at 1440p / 2160p internal: the bonfire list clipped its text to 207,286 517x42 of a 3840x2160
+        // target, and every menu line came out empty). A rectangle inside the canvas, other than the whole canvas, under a viewport covering the whole target is scaled to the target
+        else { static int cw = -1, ch; if (cw < 0) { const char *e = getenv("DM_UI_CANVAS"); cw = DM_GAME_UI_CANVAS_W; ch = DM_GAME_UI_CANVAS_H; if (e && sscanf(e, "%dx%d", &cw, &ch) != 2) cw = 0; if (cw <= 0 || ch <= 0) cw = 0; }
+          if (cw && tw > (NSUInteger)cw && th > (NSUInteger)ch && x1 <= cw && y1 <= ch && !(x0 == 0 && y0 == 0 && x1 == cw && y1 == ch) && S.has_vp && S.vp[0][2] == tw && S.vp[0][3] == th) {
+              double fx = (double)tw / cw, fy = (double)th / ch; x0 = lround(x0 * fx); y0 = lround(y0 * fy); x1 = lround(x1 * fx); y1 = lround(y1 * fy); } }
         if (x1 > (long)tw) x1 = tw; if (y1 > (long)th) y1 = th;
         if (x1 <= x0 || y1 <= y0) { PD("Z %llu draw skipped: empty scissor (%d,%d %dx%d, target %lux%lu)", g_stat_pass, R.sc.x, R.sc.y, R.sc.w, R.sc.h, (unsigned long)tw, (unsigned long)th); return; }
         sc = (MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)};
