@@ -7506,8 +7506,31 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     id<MTL4CommandBuffer> cb = g_present_cb[alloc_i];
     [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
     if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
+    // DM_SCREEN_SHOT=present,present,...:path (%d = present number): the drawable itself, after the present's own encoding (MetalFX upscale included), read back to a PNG:
+    // exactly what the window shows, unlike DM_NVN_SHOT (the game's picture) or DM_NVN_SHOT_OUT (the old-queue present). Needs the layer readable (front_mac.m sets framebufferOnly = NO)
+    static long ss_at[512]; static int ss_n = -1; static const char *ss_path; static __strong id<MTLBuffer> ss_buf[512];
+    if (ss_n < 0) { ss_n = 0; const char *e = getenv("DM_SCREEN_SHOT"), *c = e ? strchr(e, ':') : NULL;
+        if (c) { ss_path = c + 1; for (const char *q = e; q < c && ss_n < 512; q = strchr(q, ',') ? strchr(q, ',') + 1 : c) ss_at[ss_n++] = atol(q); } }
+    int ss_i = -1; for (int i = 0; i < ss_n; i++) if ((long)g_present_n == ss_at[i]) ss_i = i;
+    if (ss_i >= 0 && !dr.texture.framebufferOnly) {
+        id<MTLTexture> t = dr.texture; size_t row = t.width * 4;
+        ss_buf[ss_i] = [g_dev newBufferWithLength:row * t.height options:MTLResourceStorageModeShared]; res_add(ss_buf[ss_i]); res_commit();
+        id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+        [ce copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(t.width, t.height, 1) toBuffer:ss_buf[ss_i] destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row * t.height];
+        m4_end(ce);
+    }
     [cb endCommandBuffer];
     MTL4CommitOptions *o = [MTL4CommitOptions new];
+    if (ss_i >= 0 && ss_buf[ss_i]) { id<MTLBuffer> b = ss_buf[ss_i]; size_t w = dr.texture.width, h = dr.texture.height; MTLPixelFormat pf = dr.texture.pixelFormat; char path[1024]; snprintf(path, sizeof path, ss_path, (int)g_present_n); NSString *ps = @(path); ss_buf[ss_i] = nil;
+        [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            int bgra = pf == MTLPixelFormatBGRA8Unorm || pf == MTLPixelFormatBGRA8Unorm_sRGB; CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+            CGContextRef ctx = CGBitmapContextCreate(b.contents, w, h, 8, w * 4, cs, bgra ? (kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little) : (CGBitmapInfo)kCGImageAlphaNoneSkipLast);
+            CGImageRef img = ctx ? CGBitmapContextCreateImage(ctx) : NULL; CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)ps.UTF8String, strlen(ps.UTF8String), false);
+            CGImageDestinationRef d = url && img ? CGImageDestinationCreateWithURL(url, (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL) : NULL; int ok = 0;
+            if (d) { CGImageDestinationAddImage(d, img, NULL); ok = CGImageDestinationFinalize(d); CFRelease(d); }
+            if (url) CFRelease(url); CGImageRelease(img); CGContextRelease(ctx); CGColorSpaceRelease(cs);
+            MLOG("screen shot %zux%zu → %s %s", w, h, ps.UTF8String, ok ? "ok" : "failed"); }); }]; }
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
         if (f.error) MLOG("[RED] display command buffer error: %s", f.error.description.UTF8String);
         pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
