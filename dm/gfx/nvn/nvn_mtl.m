@@ -1962,11 +1962,7 @@ void ms_after(void);
 // ---------- Store lookahead: at pass end, decide from the later commands of the same submission whether each attachment's write-back is redundant ----------
 // On TBDR every attachment is written back to memory in full when the pass ends; Switch (Maxwell immediate-mode rendering) has no such cost. If an attachment is cleared in full before being read, the write-back is redundant (DontCare).
 // For the decision see mtl_sub_index / sdx_decide; only what can be proven within the same submission is accepted, and anything still undecided at the end of the submission is always written back.
-<<<<<<< Updated upstream
-typedef struct { uint64_t ser, bytes; uint32_t lv, sl; int idx; uint8_t depth, state, ridx, drawn, why, load, wrote, wwhy, owrote; const char *wkey; int wslot; } sd_att;   // depth: 0 color 1 depth 2 stencil (the two parts of a combined depth-stencil texture are decided separately)   // state 0 undecided 1 needed 2 redundant; idx: color attachment index, -1 for depth
-=======
 typedef struct { uint64_t ser, bytes; uint32_t lv, sl; int idx; uint8_t depth, state, ridx, drawn, why, load, wrote, wwhy, owrote, iwrote; const char *wkey; int wslot; } sd_att;   // depth: 0 color 1 depth 2 stencil (the two parts of a combined depth-stencil texture are decided separately)   // state 0 undecided 1 needed 2 redundant; idx: color attachment index, -1 for depth
->>>>>>> Stashed changes
 static sd_att g_sd[9]; static int g_nsd;
 static int g_udc_ab = -1, g_udc_ab_on;
 // Attachments this pass did not write (depth / stencil test only, color write mask 0, etc.) get their write-back changed to DontCare: the content is already in memory, saving one full write-back.
@@ -2987,11 +2983,7 @@ static void udc_note_draw(NvProg *pr) {
                 && (S.ds.fail_f != NVN_STENCIL_OP_KEEP || S.ds.zfail_f != NVN_STENCIL_OP_KEEP || S.ds.zpass_f != NVN_STENCIL_OP_KEEP
                     || S.ds.fail_b != NVN_STENCIL_OP_KEEP || S.ds.zfail_b != NVN_STENCIL_OP_KEEP || S.ds.zpass_b != NVN_STENCIL_OP_KEEP)) { ow = 1; why = 5; }
         if (ow && (t->depth || !fs_colors_known || (shader_color_mask >> t->idx & 1))) t->owrote = 1;   // a channel mask alone does not write a color the fragment never outputs
-<<<<<<< Updated upstream
-        if (image_write) { t->wrote = 1; t->wwhy = 1; } else if (ow) { t->wrote = 1; t->wwhy = (uint8_t)why; }
-=======
         if (image_write) { t->wrote = 1; t->wwhy = 1; t->iwrote = 1; } else if (ow) { t->wrote = 1; t->wwhy = (uint8_t)why; }
->>>>>>> Stashed changes
     }
 }
 // NVN's BindProgram(program, stage bits) binds per stage: the stages in the bits take that program's shaders (a null program unbinds them), the other stages stay.
@@ -4033,16 +4025,10 @@ static void sd_finish(void) {
         for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i];
             // A loaded attachment the pass's draws never wrote through their outputs holds exactly what was loaded: storing it changes nothing in a serial world, but on a tile GPU the tile
             // write-back races with image stores the same pass makes into that texture (an image store lands at another pixel than the fragment's own) and puts stale texels back over them.
-<<<<<<< Updated upstream
-            // Dark Souls Remastered's ambient occlusion (fragment c1d0b7f1a8a50799) binds its 960x540 output as the pass's attachment and writes it only by image store: the stale texels
-            // became bright dots in the sky at 4K on the M4 Pro, a few per frame, some runs only. DontCare skips the write-back; the content stays the image stores' (DM_NVN_UNWRITTEN_DC=0 restores it)
-            MTLStoreAction sa = udc_on() && t->load && !t->owrote ? MTLStoreActionDontCare : MTLStoreActionStore;
-=======
             // Only a pass that made image stores qualifies (iwrote): attachments some draw path writes without passing through udc_note_draw kept no write-back otherwise, and DSR rendered black.
             // Dark Souls Remastered's ambient occlusion (fragment c1d0b7f1a8a50799) binds its 960x540 output as the pass's attachment and writes it only by image store: the stale texels
             // became bright dots in the sky at 4K on the M4 Pro, a few per frame, some runs only. DontCare skips the write-back; the content stays the image stores' (DM_NVN_UNWRITTEN_DC=0 restores it)
             MTLStoreAction sa = udc_on() && t->load && t->iwrote && !t->owrote ? MTLStoreActionDontCare : MTLStoreActionStore;
->>>>>>> Stashed changes
             if (sa == MTLStoreActionDontCare) PD("Z %llu %s ser=%llu lv%u sl%u dontcare-unwritten", g_stat_pass, t->depth == 1 ? "d" : t->depth == 2 ? "s" : "c", (unsigned long long)t->ser, t->lv, t->sl);
             if (t->depth == 1) [g_enc setDepthStoreAction:sa]; else if (t->depth == 2) [g_enc setStencilStoreAction:sa]; else [g_enc setColorStoreAction:sa atIndex:(NSUInteger)t->idx]; }
         g_nsd = 0; return; }
