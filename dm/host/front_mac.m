@@ -74,6 +74,9 @@ void front_run(void (*guest)(void)) {
         g_layer.device = MTLCreateSystemDefaultDevice();
         g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         if (getenv("DM_SCREEN_SHOT")) g_layer.framebufferOnly = NO;   // DM_SCREEN_SHOT (nvn_mtl.m) reads the drawable back
+        // DM_LAYER_COLORSPACE=srgb|p3 tags the layer's colour space (untagged by default). Test switch for purple bands seen only in fullscreen on an XDR panel,
+        // which neither the drawable nor a screen capture shows: an untagged layer is passed to the display as is when fullscreen skips the compositor.
+        { const char *cs = getenv("DM_LAYER_COLORSPACE"); if (cs && *cs) { CGColorSpaceRef c = CGColorSpaceCreateWithName(!strcmp(cs, "p3") ? kCGColorSpaceDisplayP3 : kCGColorSpaceSRGB); g_layer.colorspace = c; CGColorSpaceRelease(c); } }
         g_layer.opaque = !getenv("DM_LAYER_TRANSLUCENT");   // The game leaves alpha < 1 in parts of its swapchain (Dark Souls: screen edges); a non-opaque layer let the white window background show through as flickering bars
         g_layer.contentsScale = win.backingScaleFactor;
         v.layer = g_layer;
