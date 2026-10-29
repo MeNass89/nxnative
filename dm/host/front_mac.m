@@ -86,7 +86,10 @@ void front_run(void (*guest)(void)) {
         [win makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
         win.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
-        { const char *fs = getenv("DM_FULLSCREEN"); if (fs && atoi(fs)) [win toggleFullScreen:nil]; }   // start in fullscreen (the player's launcher setting)
+        // DM_FULLSCREEN=1: go fullscreen once the game is up (the player's launcher setting). Entering it before the first frames crashed Dark Souls Remastered at
+        // launch, while a window switched to fullscreen later plays well (and gets Game Mode), so the window opens first and goes fullscreen 2 s later
+        { const char *fs = getenv("DM_FULLSCREEN"); if (fs && atoi(fs)) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            if (!(win.styleMask & NSWindowStyleMaskFullScreen)) [win toggleFullScreen:nil]; }); }
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
             // The window has no menu bar: Command-F / Control-Command-F toggles fullscreen, Command-Q quits
