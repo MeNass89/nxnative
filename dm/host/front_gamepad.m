@@ -6,6 +6,7 @@
 #import <GameController/GameController.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "dm_input.h"
 
 static int g_by_label;
@@ -24,6 +25,13 @@ static void publish(GCExtendedGamepad *g) {
         a[2] = ax(g.rightThumbstick.xAxis.value); a[3] = ax(g.rightThumbstick.yAxis.value);
     }
     dm_pad_set(b, a[0], a[1], a[2], a[3]);
+    // DM_PADLOG=1: one line per button change (and per stick move past a tenth of its range) with the guest frame and wall time, to replay or review a session
+    static int on = -1; if (on < 0) on = getenv("DM_PADLOG") != NULL;
+    if (on) { static uint64_t pb; static int32_t pa[4];
+        int moved = 0; for (int i = 0; i < 4; i++) if (abs(a[i] - pa[i]) > DM_STICK_MAX / 10 || (a[i] == 0) != (pa[i] == 0)) moved = 1;
+        if (b != pb || moved) { uint64_t dm_guest_frame(void); struct timespec t; clock_gettime(CLOCK_REALTIME, &t);
+            fprintf(stderr, "[dm] PADLOG f%llu t%ld.%03ld buttons %#llx L %d %d R %d %d\n", (unsigned long long)dm_guest_frame(), (long)t.tv_sec, t.tv_nsec / 1000000, (unsigned long long)b, a[0], a[1], a[2], a[3]);
+            pb = b; memcpy(pa, a, sizeof pa); } }
 }
 static void attach(GCController *c) {
     GCExtendedGamepad *g = c.extendedGamepad; if (!g) return;
