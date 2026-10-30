@@ -120,6 +120,14 @@ void front_run(void (*guest)(void)) {
             if (sz.width > 0 && sz.height > 0) { g_layer.contentsScale = sc; g_layer.drawableSize = CGSizeMake(round(sz.width * sc), round(sz.height * sc)); } };
         for (NSNotificationName nm in @[NSWindowDidResizeNotification, NSWindowDidChangeBackingPropertiesNotification, NSWindowDidEnterFullScreenNotification, NSWindowDidExitFullScreenNotification])
             [nc addObserverForName:nm object:win queue:nil usingBlock:fit];
+        // Fullscreen stays composited: an opaque fullscreen layer is scanned out directly, where Dark Souls Remastered at 2K120 with MetalFX fell to 80 fps (GPU 4.4 -> 8.4 ms
+        // per frame, same scene, M4 Pro) and showed purple bands; a non-opaque layer keeps the window server compositing it (120 fps, no purple). The present writes alpha 1
+        // everywhere, so nothing shows through. DM_FULLSCREEN_DIRECT=1 keeps direct scanout
+        if (!getenv("DM_FULLSCREEN_DIRECT") && !getenv("DM_LAYER_TRANSLUCENT")) {
+            win.backgroundColor = NSColor.blackColor;
+            [nc addObserverForName:NSWindowWillEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_layer.opaque = NO; }];
+            [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_layer.opaque = YES; }];
+        }
         fit(nil);
         [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; if (!win.miniaturized) dm_focus_set(2); }];
         [nc addObserverForName:NSWindowDidBecomeKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_focus_set(1); }];
