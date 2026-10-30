@@ -2955,15 +2955,16 @@ static void bare_dims(NSUInteger *w, NSUInteger *h) {
     *w = (NSUInteger)MIN(MAX(ceil(x1), 1.0), 16384.0); *h = (NSUInteger)MIN(MAX(ceil(y1), 1.0), 16384.0);
 }
 static void udc_note_draw(NvProg *pr) {
-    if (!tbdr_on()) {   // without the TBDR set only the duplicate-slot report below is live (the zero-source skip and the unwritten-attachment store are part of the set): skip the per-draw scans
+    if (!tbdr_on() && !udc_on()) {   // without the TBDR set and the unwritten-attachment store only the duplicate-slot report below is live: skip the per-draw scans. With TBDR off the unwritten-attachment
+                                     // store (sd_finish) still needs owrote / iwrote: returning here for every draw left them 0, and the image-store DontCare never applied (DSR sky / bonfire dots came back)
         uint32_t cm = pr && pr->sh[1] ? pr->sh[1]->rf.color_mask : 0;
         if (R.has_rt && cm >> 1) for (int i = 1; i < R.rt.n && i < 8; i++)
             if ((cm >> i & 1) && ((S.chmask.mask >> (4 * i)) & 0xf) && rt_dup_slot(&R.rt, i))
                 RED_ONCE(79, "color slot %d holds the same texture as an earlier slot (ser=%llu) and this draw writes it (mask %#x): these writes are lost", i, (unsigned long long)R.rt.color[i]->serial, (S.chmask.mask >> (4 * i)) & 0xf);
         return;
     }
-    if (R.has_rt) for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) { zskip_del(R.rt.color[i]->serial); g_zskip_cand_ok[i] = 0; }   // Zero-source set: once really drawn it is no longer all zeros
-    if (pr) for (int st = 0; st < 6; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue; for (int i = 0; i < sh->rf.nb; i++) if (sh->rf.b[i].kind == NVN_RB_IMG) { zskip_clear(); break; } }   // Image slots are writable: conservatively clear
+    if (tbdr_on() && R.has_rt) for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) { zskip_del(R.rt.color[i]->serial); g_zskip_cand_ok[i] = 0; }   // Zero-source set: once really drawn it is no longer all zeros
+    if (tbdr_on() && pr) for (int st = 0; st < 6; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue; for (int i = 0; i < sh->rf.nb; i++) if (sh->rf.b[i].kind == NVN_RB_IMG) { zskip_clear(); break; } }   // Image slots are writable: conservatively clear
     int image_write = 0;
     uint32_t shader_color_mask = 0; int fs_colors_known = 0;   // fs_colors_known: the fragment's color list was recorded at packaging (an empty list = it writes no color output)
     if (pr) for (int st = 0; st < 6; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue;

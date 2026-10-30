@@ -37,7 +37,8 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             else if ([k isEqualToString:@"tex_ubo"]) { r->kind = NVN_RB_TEXU; dummy_kind(b[@"msl_type"], &r->dtt, &r->dpf); r->off = (uint16_t)[b[@"off"] intValue]; o->bindless = 1; }
             else if ([k isEqualToString:@"samp_ubo"]) { r->kind = NVN_RB_SAMPU; r->off = (uint16_t)[b[@"off"] intValue]; o->bindless = 1; }
             else if ([k isEqualToString:@"samp_id"]) r->kind = NVN_RB_SAMPI;
-            else if ([k isEqualToString:@"img"]) { r->kind = NVN_RB_IMG; dummy_kind(b[@"msl_type"], &r->dtt, &r->dpf); }
+            else if ([k isEqualToString:@"img"]) { r->kind = NVN_RB_IMG; dummy_kind(b[@"msl_type"], &r->dtt, &r->dpf);   // writable unless declared read-only (the json has no "rw" for images: rw stayed 0 and the image-store DontCare of sd_finish never applied)
+                NSString *ty = b[@"msl_type"]; r->rw = !([ty isKindOfClass:[NSString class]] && [ty containsString:@"access::read>"]); }
             else if ([k isEqualToString:@"tbuf"]) { r->kind = NVN_RB_TBUF; uint8_t tt; dummy_kind(b[@"msl_type"], &tt, &r->dpf); }
             else if ([k isEqualToString:@"sbuf"]) { r->kind = NVN_RB_SBUFP; r->rw = [b[@"rw"] boolValue]; }
             else if ([k isEqualToString:@"ubo_ptr"]) r->kind = NVN_RB_UBOP;
