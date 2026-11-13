@@ -39,13 +39,21 @@ Automated tests use `DM_AUDIO=1 DM_AUDIO_MUTE=1`, copied saves, and one guard at
 
 The terminal transfer fixture (`dm/gfx/tests/t_sdr_transfer.m`) compares hardware sRGB attachment encoding against the exact piecewise shader formula. On M4 Pro it passed 32,768 pixels /98,304 RGB channels: maximum difference1LSB, no difference greater than1LSB, alpha and GPU errors zero. This is a transfer check, not a whole-game image-equivalence test. Reproduce it with `xcrun clang -O1 -fobjc-arc dm/gfx/tests/t_sdr_transfer.m -framework Foundation -framework Metal -o /tmp/oot-sdr-transfer` followed by `/tmp/oot-sdr-transfer`.
 
-The integrated private build with these sources completed a silent139.83s Hyrule Castle Town run, including opening the inventory and returning to the world. There were2,972 packets taken and released,5,944 UI renders, zero UI failures, zero runtime private-table allocations and zero table-pool misses. Screenshots of the active world, inventory and recovered world were examined. Original executable, NSO and protected saves stayed unchanged.
+The preceding checkpoint (`9ae4927`, before the two additional proof entries) completed a silent139.83s Hyrule Castle Town run, including opening the inventory and returning to the world. There were2,972 packets taken and released,5,944 UI renders, zero UI failures, zero runtime private-table allocations and zero table-pool misses. Screenshots of the active world, inventory and recovered world were examined. Original executable, NSO and protected saves stayed unchanged.
 
 The retained110-134s window showed101.04 actual displayed images/s, not120. It contained1,214 native and1,212 generated presentations, no abandoned drawable, maximum gap25ms,1,153 low-generation batches and61 legacy generations (5.02% fallback). Native GPU command-buffer envelope was18.087ms median /19.509ms p95, GPU1578MHz and thermal pressure0. These envelopes are not exclusive busy times. A previous candidate measured99.28images/s in another run; differing scene time/NPC state mean this is **not a causal A/B speedup**.
 
+## Two additional observed UI proof entries
+
+This revision adds only the original VS `b05272e4699e2955` and FS `bbec88c9a94348a3` resource bounds. Their asset/dialogue identity is not established. No shader source or image arithmetic changes. The FS dynamic C1 lookups are limited to40bytes; support needs212bytes, CB4 needs52, SSBO6 needs628 and border64. Existing format, alias, entry, coverage and lifetime guards remain.
+
+The private host built successfully and was observed in Hyrule, inventory and recovered Hyrule at77/89/102seconds. There were2,744 packets taken and released,5,488 UI renders, zero UI failures and zero runtime private-table allocations. The next first unsupported pair changed, consistent with the new pair passing the resource planner. This is not full image-equivalence proof.
+
+The run did **not** pass its complete acceptance bar: the OOT window disappeared before the final137second screenshot (cause unknown), and recovery had one private-table pool miss with safe fallback. The harness stopped and cleaned at138.48seconds. Original host, NSO and protected saves remained unchanged. There is no causal FPS improvement, full dialogue/transparency fix or production-installation claim from this revision.
+
 ## Remaining work
 
-- The next unsupported pair observed is VS`b05272e4699e2955` /FS`bbec88c9a94348a3`. Other UI scenes, dialogue, cutscenes and transitions remain unqualified. Preserve fallback.
+- The next first unsupported pair in the follow-up is VS`db0ef805fff119c5` /FS`721839834984d56a`. Other UI scenes, dialogue, cutscenes and transitions remain unqualified. Preserve fallback and investigate the one recovery table-pool miss before promotion.
 - The low and legacy routes can differ in sharpness. The single-stage spatial reconstruction is softer; improved image quality is not established.
 - Object motion is not yet supplied to FI. Existing animated-character/translucent-overlay interpolation artifacts remain open.
 - Stable120Hz delivery and GPU headroom in heavy scenes are not proved. Prioritize the native rendering cost rather than repeatedly extending UI coverage as a proxy for speed.

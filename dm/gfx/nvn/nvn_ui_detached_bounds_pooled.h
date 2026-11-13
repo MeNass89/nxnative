@@ -120,7 +120,30 @@ static const uidp_bound uidp_b14[] = {
 static const uidp_bound uidp_b15[] = {
     {NVN_RB_CBUF,4,0,0,44u},
 };
+// Observed exact pair, bc8830d4ba5a ordinary vertex and float fragment entries.
+static const uidp_bound uidp_b16[] = {
+    {NVN_RB_CBUF,1,0,0,64u},
+    {NVN_RB_SBUFP,6,1,0,344u},
+};
+static const uidp_bound uidp_b17[] = {
+    {NVN_RB_SUPPORT,-1,0,0,212u},
+    {NVN_RB_C1,-1,1,0,40u},
+    {NVN_RB_CBUF,4,2,0,52u},
+    {NVN_RB_SBUFP,6,3,0,628u},
+    {NVN_RB_TEX,8,4,0,0u},
+    {NVN_RB_SAMPT,8,5,0,0u},
+    {NVN_RB_TEX,9,6,0,0u},
+    {NVN_RB_SAMPT,9,7,0,0u},
+    {NVN_RB_TEX,10,8,0,0u},
+    {NVN_RB_SAMPT,10,9,0,0u},
+    {NVN_RB_SAMPT,8,10,1,0u},
+    {NVN_RB_SAMPT,9,11,2,0u},
+    {NVN_RB_SAMPT,10,12,3,0u},
+    {NVN_RB_BORDER,-1,13,0,64u},
+};
 static const uidp_shader uidp_shaders[] = {
+    {"b05272e4699e2955_b","5abbf17ce322f2e18fbcf3106b8c3f13329b826e253fd5f95b9e8c6da2674815",0,2,uidp_b16},
+    {"bbec88c9a94348a3_b","8336ba43380a988d86122d62aa7a3e9b2161acb471a3677cf1779c842ba4b2ce",1,14,uidp_b17},
     {"0810c438f79a162e_b","20553cb6382117b577ec08cca8237c9ac1dca7221e3151e14f9591f47751943b",1,6,uidp_b0},
     {"10aa2bcea1336dd0_b","e8ffd2810041d88842bd3bdbe290a0c63e2d7789188720579c77b608c5540198",0,3,uidp_b1},
     {"2f9948fcc9c860a7_b","371324b0691c92a9c1549d762e9f000c07a3bcf7e104d3a108d0181e396cadfe",1,6,uidp_b2},
