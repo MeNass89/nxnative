@@ -71,6 +71,7 @@ static int up_recipe_draw(const up_recipe *r, id<MTLTexture> in, id<MTLTexture> 
         [sc encodeToCommandBuffer:cb];
     });
     up_recipe_compute(g_up_recipe_encode, result, out);
+    low_ui_prepare(out,color);
     // MTL4 command buffers do not retain resources; image views and scaler survive the GPU fence.
     defer_obj_unref(in); defer_obj_unref(out); defer_obj_unref(sc);
     g_last_end_relaxed = 0; args_dirty_all();

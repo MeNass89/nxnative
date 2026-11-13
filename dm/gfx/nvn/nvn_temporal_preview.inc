@@ -267,6 +267,81 @@ static void hdr_observe_final(NvProg *program) {
     id<MTLTexture> window=cached_window;
     if(window.pixelFormat!=MTLPixelFormatRGB10A2Unorm || window.textureType!=MTLTextureType2D || window.sampleCount!=1)return;
     g_hdr_native_linear=src;g_hdr_native_frame=atomic_load(&g_cur_frame);g_hdr_native_window=R.rt.color[0]->serial;
+    low_ui_submit_final(src);
+}
+// Independent SDR identity; never sets the HDR transport state.
+static id<MTLTexture> g_low_sdr_final_source;
+static uint64_t g_low_sdr_final_frame=UINT64_MAX,g_low_sdr_final_window;
+enum { LOW_SDR_FINAL_CANDIDATE,LOW_SDR_PAIR_MISMATCH,LOW_SDR_COPY_MISMATCH,LOW_SDR_OBSERVER_ENTER,LOW_SDR_PROGRAM_TARGET_VIEW,LOW_SDR_SOURCE_LOOKUP,LOW_SDR_SOURCE_SHAPE,LOW_SDR_WINDOW_UNCACHED,LOW_SDR_WINDOW_SHAPE,LOW_SDR_WINDOW_SWIZZLE,LOW_SDR_OBSERVER_ACCEPT,LOW_SDR_LATER_DRAW,LOW_SDR_STEP_COUNT };
+static _Atomic uint64_t g_low_sdr_steps[LOW_SDR_STEP_COUNT];
+typedef struct {uint64_t frame,sourceSerial,targetSerial,sourceFormat,sourceW,sourceH,targetFormat,targetW,targetH,effectiveTargetFormat,targetBaseNVN,targetViewNVN;double viewport[4];} LowSDRFirst;
+static LowSDRFirst g_low_sdr_step_first[LOW_SDR_STEP_COUNT];static pthread_mutex_t g_low_sdr_step_mu=PTHREAD_MUTEX_INITIALIZER;
+static void low_sdr_step(unsigned step,id<MTLTexture>source,id<MTLTexture>target){
+    if(atomic_fetch_add(&g_low_sdr_steps[step],1))return;
+    LowSDRFirst first={.frame=atomic_load(&g_cur_frame),.sourceSerial=g_temporal_ui_serial,.targetSerial=R.rt.n&&R.rt.color[0]?R.rt.color[0]->serial:0,.sourceFormat=source.pixelFormat,.sourceW=source.width,.sourceH=source.height,.targetFormat=target.pixelFormat,.targetW=target.width,.targetH=target.height,.effectiveTargetFormat=g_pass.cfmt[0],.targetBaseNVN=R.rt.n&&R.rt.color[0]?R.rt.color[0]->d.format:0,.targetViewNVN=R.rt.n&&R.rt.has_cview[0]&&R.rt.cview[0].set_format?R.rt.cview[0].format:0};
+    for(int i=0;i<4;i++)first.viewport[i]=S.has_vp?S.vp[0][i]:0;
+    pthread_mutex_lock(&g_low_sdr_step_mu);g_low_sdr_step_first[step]=first;pthread_mutex_unlock(&g_low_sdr_step_mu);
+}
+static NSDictionary*low_sdr_observer_stats(void){
+    const char*names[LOW_SDR_STEP_COUNT]={"final_program_candidate","pair_frame_mismatch","temporal_final_copy_mismatch","observer_enter","program_target_or_view_rejected","source_lookup_rejected","source_shape_or_viewport_rejected","window_not_cached","window_shape_rejected","window_swizzle_rejected","observer_accepted","later_draw_invalidated"};
+    NSMutableDictionary*out=[NSMutableDictionary dictionary];pthread_mutex_lock(&g_low_sdr_step_mu);
+    for(unsigned i=0;i<LOW_SDR_STEP_COUNT;i++){LowSDRFirst*f=&g_low_sdr_step_first[i];out[@(names[i])]=@{@"count":@(atomic_load(&g_low_sdr_steps[i])),@"first_frame":@(f->frame),@"source_serial":@(f->sourceSerial),@"target_serial":@(f->targetSerial),@"source_format":@(f->sourceFormat),@"source_width":@(f->sourceW),@"source_height":@(f->sourceH),@"target_format":@(f->targetFormat),@"target_width":@(f->targetW),@"target_height":@(f->targetH),@"effective_target_format":@(f->effectiveTargetFormat),@"target_base_nvn":@(f->targetBaseNVN),@"target_view_nvn":@(f->targetViewNVN),@"viewport":@[@(f->viewport[0]),@(f->viewport[1]),@(f->viewport[2]),@(f->viewport[3])]};}
+    pthread_mutex_unlock(&g_low_sdr_step_mu);return out;
+}
+static void low_sdr_observe_final(NvProg *program) {
+    low_sdr_step(LOW_SDR_OBSERVER_ENTER,nil,nil);
+    g_low_sdr_final_source=nil;g_low_sdr_final_frame=UINT64_MAX;g_low_sdr_final_window=0;
+    // F6191 pass294194: NVN RGBA8 base0x25 + SRGB view0x38 is the
+    // observed final target. Validate metadata without creating a texture view.
+    BOOL rawSrgbView=NO;
+    if(R.rt.n==1 && R.rt.color[0] && R.rt.has_cview[0] && R.rt.cview[0].set_format &&
+       R.rt.color[0]->d.format==0x25 && R.rt.cview[0].format==0x38){
+        uint32_t baseFormat=0,viewFormat=0;uint8_t mappedSwizzle[4];int bw=0,bh=0,vw=0,vh=0;
+        rawSrgbView=nvn_fmt_to_mtl(R.rt.color[0]->d.format,&baseFormat,mappedSwizzle) && nvn_fmt_to_mtl(R.rt.cview[0].format,&viewFormat,mappedSwizzle) &&
+            baseFormat==MTLPixelFormatRGBA8Unorm && viewFormat==MTLPixelFormatRGBA8Unorm_sRGB &&
+            nvn_fmt_bpb(R.rt.color[0]->d.format,&bw,&bh)==4 && bw==1 && bh==1 && nvn_fmt_bpb(R.rt.cview[0].format,&vw,&vh)==4 && vw==1 && vh==1;
+    }
+    if(front_hdr_enabled() || !program || !program->sh[1] ||
+       strncmp(program->sh[1]->key,"29e3c9dd92b8a571",16) ||
+       R.rt.n!=1 || !R.rt.color[0] || !S.has_vp ||
+       (R.rt.has_cview[0] && ((R.rt.cview[0].set_levels && R.rt.cview[0].base_level) || (R.rt.cview[0].set_layers && R.rt.cview[0].min_layer) ||
+        (R.rt.cview[0].set_format && R.rt.cview[0].format!=R.rt.color[0]->d.format && !rawSrgbView) || (R.rt.cview[0].set_target && R.rt.cview[0].target!=R.rt.color[0]->d.target)))){low_sdr_step(LOW_SDR_PROGRAM_TARGET_VIEW,nil,nil);return;}
+    int tid=(int)(tex_slot_h(S.tex[1],S.img[1],0)&0xfffff);
+    id<MTLTexture> src=nil;
+    os_unfair_lock_lock(&g_rmu);
+    if(tid>0 && tid<g_ntreg && g_treg[tid].ok && !g_treg[tid].gone) {
+        treg_t *r=&g_treg[tid];
+        int base=!r->has_v || ((!r->v.set_levels || !r->v.base_level) && (!r->v.set_layers || !r->v.min_layer) &&
+            (!r->v.set_format || r->v.format==r->t.d.format) && (!r->v.set_target || r->v.target==r->t.d.target));
+        // The proven source is RGB-identity R11; its absent alpha reads as one.
+        // A descriptor view can override the builder's swizzle, but not its RGB.
+        uint8_t sw[4]={MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleAlpha};
+        if(r->has_v && r->v.set_swizzle)memcpy(sw,r->v.swz,sizeof sw);
+        else if(r->t.set_swz)for(int c=0;c<4;c++)sw[c]=(uint8_t)(r->t.swz>>(3*c)&7);
+        if(sw[0]!=MTLTextureSwizzleRed || sw[1]!=MTLTextureSwizzleGreen || sw[2]!=MTLTextureSwizzleBlue ||
+           (sw[3]!=MTLTextureSwizzleAlpha && sw[3]!=MTLTextureSwizzleOne))base=0;
+        if(base && r->t.serial==g_temporal_ui_serial) {
+            // Observation must not create or refresh guest storage after a draw.
+            // tex_made preserves a cached NvPkg's selected view/texture too.
+            id cached=tex_made(&r->t);
+            if([cached conformsToProtocol:@protocol(MTLTexture)])src=cached;
+        }
+    }
+    os_unfair_lock_unlock(&g_rmu);
+    if(!src)low_sdr_step(LOW_SDR_SOURCE_LOOKUP,nil,nil);
+    if(!src || src.width!=2048 || src.height!=1152 || src.pixelFormat!=MTLPixelFormatRG11B10Float || src.textureType!=MTLTextureType2D || src.sampleCount!=1 ||
+       S.vp[0][0]!=0 || S.vp[0][1]!=0 || S.vp[0][2]!=src.width || S.vp[0][3]!=src.height){low_sdr_step(LOW_SDR_SOURCE_SHAPE,src,nil);return;}
+    id cached_window=tex_made(R.rt.color[0]);
+    if(![cached_window conformsToProtocol:@protocol(MTLTexture)]){low_sdr_step(LOW_SDR_WINDOW_UNCACHED,src,nil);return;}
+    id<MTLTexture> window=cached_window;
+    if((window.pixelFormat!=MTLPixelFormatRGBA8Unorm_sRGB && !(rawSrgbView && window.pixelFormat==MTLPixelFormatRGBA8Unorm)) || window.textureType!=MTLTextureType2D || window.sampleCount!=1 || window.width!=2560 || window.height!=1440 || g_pass.cfmt[0]!=MTLPixelFormatRGBA8Unorm_sRGB || g_pass.samples!=1){low_sdr_step(LOW_SDR_WINDOW_SHAPE,src,window);return;}
+    uint8_t targetSwizzle[4]={MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleAlpha};
+    if(R.rt.has_cview[0] && R.rt.cview[0].set_swizzle)memcpy(targetSwizzle,R.rt.cview[0].swz,sizeof targetSwizzle);
+    else if(R.rt.color[0]->set_swz)for(int c=0;c<4;c++)targetSwizzle[c]=(uint8_t)(R.rt.color[0]->swz>>(3*c)&7);
+    if(targetSwizzle[0]!=MTLTextureSwizzleRed || targetSwizzle[1]!=MTLTextureSwizzleGreen || targetSwizzle[2]!=MTLTextureSwizzleBlue || targetSwizzle[3]!=MTLTextureSwizzleAlpha){low_sdr_step(LOW_SDR_WINDOW_SWIZZLE,src,window);return;}
+    g_low_sdr_final_source=src;g_low_sdr_final_frame=atomic_load(&g_cur_frame);g_low_sdr_final_window=R.rt.color[0]->serial;
+    low_sdr_step(LOW_SDR_OBSERVER_ACCEPT,src,window);
+    low_ui_submit_final(src);
 }
 static void temporal_after_draw(void) {
     int preview=temporal_preview_on();
@@ -274,12 +349,24 @@ static void temporal_after_draw(void) {
     NvProg *program = S.prog ? prog_get(S.prog) : nil;
     // HDR native transport is independent of whether extra frames are requested.
     hdr_observe_final(program);
+    // A later draw into either proven resource invalidates SDR reuse. A known
+    // final copy below can establish a new complete contract in this frame.
+    if(!front_hdr_enabled() && g_low_sdr_final_frame==atomic_load(&g_cur_frame))
+        for(unsigned i=0;i<R.rt.n;i++)if(R.rt.color[i] && (R.rt.color[i]->serial==g_low_sdr_final_window || R.rt.color[i]->serial==g_temporal_ui_serial)){
+            low_sdr_step(LOW_SDR_LATER_DRAW,g_low_sdr_final_source,nil);g_low_sdr_final_source=nil;g_low_sdr_final_frame=UINT64_MAX;g_low_sdr_final_window=0;break;
+        }
     if (!preview) return;
+    if(!front_hdr_enabled() && program && program->sh[1] && !strncmp(program->sh[1]->key,"29e3c9dd92b8a571",16)){
+        low_sdr_step(LOW_SDR_FINAL_CANDIDATE,nil,nil);
+        if(g_temporal_pair_frame!=atomic_load(&g_cur_frame))low_sdr_step(LOW_SDR_PAIR_MISMATCH,nil,nil);
+        else if(!temporal_final_copy(program,NULL))low_sdr_step(LOW_SDR_COPY_MISMATCH,nil,nil);
+    }
     // Immutable shader identity of the observed Ocarina pre-UI scene composition.
     // This is a development adapter, not a general "all games" recognition rule.
     if(temporal_preview_on()==3 && g_temporal_pair_frame==atomic_load(&g_cur_frame) &&
        temporal_final_copy(program,g_temporal_pair_viewport)) {
         g_temporal_pair_final_frame=g_temporal_pair_frame;g_temporal_pair_final_serial=R.rt.color[0]->serial;
+        low_sdr_observe_final(program);
     }
     int graded=program && program->sh[1] && (!strncmp(program->sh[1]->key,"9e09b406de439a34",16) || !strncmp(program->sh[1]->key,"99d1ecbf2947464b",16) || (front_hdr_enabled() && !strncmp(program->sh[1]->key,"774f2663242dbfcf",16)));
     int copied=!graded && g_temporal_depth_frame!=atomic_load(&g_cur_frame) && temporal_scene_copy(program);

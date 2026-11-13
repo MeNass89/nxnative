@@ -23,14 +23,15 @@ static int temporal_async_slot(uint64_t serial) {
     for(int i=0;i<SNAP_MAX;i++)if(serial && (g_snap[i].serial==serial || g_temporal_snap[i].serial==serial))return i;
     return -1;
 }
-typedef struct { uint64_t generation,presentation; } temporal_async_readers;
+typedef struct { uint64_t generation,presentation,low_ui; } temporal_async_readers;
 static temporal_async_readers temporal_async_reader(unsigned slot) {
     if(!temporal_async_on() || slot>=SNAP_MAX)return (temporal_async_readers){0};
-    return (temporal_async_readers){atomic_load(&g_temporal_snap[slot].async_reader),atomic_load(&g_temporal_snap[slot].display_reader)};
+    return (temporal_async_readers){atomic_load(&g_temporal_snap[slot].async_reader),atomic_load(&g_temporal_snap[slot].display_reader),low_route_ui_reader(slot)};
 }
 static void temporal_async_copy_wait(temporal_async_readers readers) {
     if(readers.generation)[g_q4 waitForEvent:g_temporal_async_done value:readers.generation];
     if(readers.presentation)[g_q4 waitForEvent:g_temporal_display_done value:readers.presentation];
+    if(readers.low_ui)[g_q4 waitForEvent:low_route_ui_event() value:readers.low_ui];
 }
 static void temporal_async_drain(void) {
     if(!temporal_async_on())return;
@@ -40,6 +41,7 @@ static void temporal_async_drain(void) {
     pthread_mutex_unlock(&g_temporal_async_mu);
     if(generation && ![generation_event waitUntilSignaledValue:generation timeoutMS:10000])MDIE("frame generation: GPU did not drain within 10 s");
     if(display && ![display_event waitUntilSignaledValue:display timeoutMS:10000])MDIE("snapshot display: GPU did not drain within 10 s");
+    low_route_drain();
 }
 static void temporal_async_wait_source(uint64_t serial) {
     if(!temporal_async_on())return;int slot=temporal_async_slot(serial);if(slot<0)return;
@@ -50,13 +52,18 @@ static void temporal_async_wait_source(uint64_t serial) {
         uint64_t v=atomic_load(&g_temporal_snap[slot].async_ready);
         if(v && ![g_temporal_async_done waitUntilSignaledValue:v timeoutMS:10000])MDIE("snapshot diagnostic: auxiliary producer did not complete");
     }
+    // A resolved low-route reader samples the HUD-complete result, not only FI.
+    id<MTLTexture> lowTexture=nil;id<MTLSharedEvent> lowEvent=nil;uint64_t lowValue=0;
+    pthread_mutex_lock(&g_temporal_async_mu);int lowContract=low_route_display((unsigned)slot,serial,&lowTexture,&lowEvent,&lowValue);pthread_mutex_unlock(&g_temporal_async_mu);
+    if(lowContract && lowValue && ![lowEvent waitUntilSignaledValue:lowValue timeoutMS:10000])MDIE("snapshot diagnostic: low-route HUD did not complete");
+
 }
 // Buffer diagnostic records: per-image disk flushes on completion/presented
 // callbacks can disturb cadence. Graphics drain flushes these before graceful _exit.
 static pthread_mutex_t g_framegen_async_gpu_mu=PTHREAD_MUTEX_INITIALIZER;static FILE *g_framegen_async_gpu_file;
 static void temporal_async_note_gpu(uint64_t frame,const char *kind,double begin,double end) {
     const char *path=getenv("DM_FRAMEGEN_ASYNC_GPU_TIMES");if(!path || !*path)return;
-    static char trace_buffer[1u<<20];static int opened;
+    static char trace_buffer[4u<<20];static int opened;
     pthread_mutex_lock(&g_framegen_async_gpu_mu);
     if(!opened){opened=1;g_framegen_async_gpu_file=fopen(path,"w");if(g_framegen_async_gpu_file){setvbuf(g_framegen_async_gpu_file,trace_buffer,_IOFBF,sizeof trace_buffer);fprintf(g_framegen_async_gpu_file,"frame\tkind\tgpu_start_s\tgpu_end_s\tgpu_ms\n");}}
     if(g_framegen_async_gpu_file){fprintf(g_framegen_async_gpu_file,"%llu\t%s\t%.9f\t%.9f\t%.6f\n",(unsigned long long)frame,kind,begin,end,(end-begin)*1000);}
@@ -198,6 +205,12 @@ static id<MTLTexture> temporal_async_upscale(id<MTLCommandBuffer> cb,id<MTLTextu
     s->scaler.colorTexture=input;s->scaler.outputTexture=output;s->scaler.inputContentWidth=r[2];s->scaler.inputContentHeight=r[3];[s->scaler encodeToCommandBuffer:cb];
     *keep=@[s->scaler,input,output];return output;
 }
+// PRIVATE causal test: keep native simulation, vsync, FIFO and image work unchanged.
+// Alter only the positive minimum duration requested for each asynchronous display.
+static int present_min_slack_probe(uint64_t frame) {
+    static int on=-1;if(on<0){const char *e=getenv("DM_PRESENT_MIN_CONTROL");on=e && !strcmp(e,"1");}
+    return on && frame>=3600 && ((frame-3600)/180%4==1 || (frame-3600)/180%4==2);
+}
 // A full-size, same-format copy preserves the scaler's encoded pixels. It
 // avoids a render pass when the drawable cannot be a legal MetalFX output.
 // Crops, orientation changes and framebuffer-only destinations keep present_encode.
@@ -212,6 +225,7 @@ static int temporal_async_present_copy(id<MTLCommandBuffer> cb,id<MTLTexture> so
     [copy endEncoding];return 1;
 }
 static int temporal_async_present(uint64_t serial,id<MTLTexture> src,double period,uint64_t frame,uint64_t ticket,const int crop[4],id<CAMetalDrawable> drawable,double target,int generated) {
+    id<MTLTexture> resolvedSource=src;
     int slot=temporal_async_slot(serial);if(slot<0 || !temporal_async_init())return -1;
     pthread_mutex_lock(&g_temporal_async_mu);
     id<MTLCommandBuffer> cb=[g_temporal_display_queue commandBuffer];if(!cb){pthread_mutex_unlock(&g_temporal_async_mu);return 0;}
@@ -220,18 +234,24 @@ static int temporal_async_present(uint64_t serial,id<MTLTexture> src,double peri
     // wait for their own result, never a later history read of this slot.
     uint64_t ready=generated?atomic_load(&g_temporal_snap[slot].async_ready):0;
     if(ready)[cb encodeWaitForEvent:g_temporal_async_done value:ready];
-    NSArray *keep=nil;id<MTLTexture> up=temporal_async_upscale(cb,src,crop,drawable.texture,&keep);int rect[4]={0,0,(int)up.width,(int)up.height};
-    static int noted[2];if(up && !noted[!!generated]++){MLOG("asynchronous final MetalFX: %s, source %lux%lu -> drawable %lux%lu",generated?"generated":"native",(unsigned long)src.width,(unsigned long)src.height,(unsigned long)drawable.texture.width,(unsigned long)drawable.texture.height);}
-    if(up!=drawable.texture && !(up && temporal_async_present_copy(cb,up,drawable.texture)) && !present_encode(cb,up?:src,drawable.texture,up?rect:crop)){pthread_mutex_unlock(&g_temporal_async_mu);return 0;}
+    id<MTLTexture>lowTexture=nil;id<MTLSharedEvent>lowEvent=nil;uint64_t lowValue=0;int lowCrop[4];
+    int lowContract=low_route_display((unsigned)slot,serial,&lowTexture,&lowEvent,&lowValue);
+    if(lowContract){
+        [cb encodeWaitForEvent:lowEvent value:lowValue];resolvedSource=lowTexture;lowCrop[0]=lowCrop[1]=0;lowCrop[2]=(int)resolvedSource.width;lowCrop[3]=(int)resolvedSource.height;crop=lowCrop;
+    }
+    NSArray *keep=nil;id<MTLTexture> up=lowContract==2?nil:temporal_async_upscale(cb,resolvedSource,crop,drawable.texture,&keep);int rect[4]={0,0,(int)up.width,(int)up.height};
+    static int noted[2];if(up && !noted[!!generated]++){MLOG("asynchronous final MetalFX: %s, source %lux%lu -> drawable %lux%lu",generated?"generated":"native",(unsigned long)resolvedSource.width,(unsigned long)resolvedSource.height,(unsigned long)drawable.texture.width,(unsigned long)drawable.texture.height);}
+    if(lowContract==2 ? (resolvedSource.width!=drawable.texture.width || resolvedSource.height!=drawable.texture.height || !present_encode_color(cb,resolvedSource,drawable.texture,crop,1)) : (up!=drawable.texture && !(up && temporal_async_present_copy(cb,up,drawable.texture)) && !present_encode_color(cb,up?:resolvedSource,drawable.texture,up?rect:crop,0))){pthread_mutex_unlock(&g_temporal_async_mu);return 0;}
     uint64_t value=++g_temporal_display_sequence;atomic_store(&g_temporal_snap[slot].display_reader,value);
     [cb encodeSignalEvent:g_temporal_display_done value:value];
     present_track_drawable(drawable,frame,ticket,generated);
-    if(target>0 || period<=0)[cb presentDrawable:drawable];else [cb presentDrawable:drawable afterMinimumDuration:period];
+    int min_slack=target<=0 && period>0 && present_min_slack_probe(frame);
+    if(target>0 || period<=0)[cb presentDrawable:drawable];else [cb presentDrawable:drawable afterMinimumDuration:period*(min_slack?0.98:1.0)];
     [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
         (void)keep.count;
         if(finished.error){MLOG("[RED] auxiliary display GPU error: %s",finished.error.description.UTF8String);gpu_lost_check(finished.error,"auxiliary display");}
         pthread_mutex_lock(&g_pq_mu);if(!generated && ticket>g_pq_done)g_pq_done=ticket;g_pq_inflight--;present_gpu_note(finished.GPUEndTime-finished.GPUStartTime,up!=nil);pthread_cond_broadcast(&g_pq_cv);pthread_mutex_unlock(&g_pq_mu);
-        temporal_async_note_gpu(frame,up==drawable.texture?(generated?"generated display direct":"native display direct"):(generated?"generated display":"native display"),finished.GPUStartTime,finished.GPUEndTime);
+        temporal_async_note_gpu(frame,min_slack?(up==drawable.texture?(generated?"generated display direct slack":"native display direct slack"):(generated?"generated display slack":"native display slack")):up==drawable.texture?(generated?"generated display direct":"native display direct"):(generated?"generated display":"native display"),finished.GPUStartTime,finished.GPUEndTime);
     }];
     pthread_mutex_lock(&g_pq_mu);g_pq_inflight++;pthread_mutex_unlock(&g_pq_mu);
     [cb commit];atomic_store(&g_temporal_display_latest,value);

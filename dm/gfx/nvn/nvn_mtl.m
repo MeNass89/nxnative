@@ -284,6 +284,11 @@ static void ws_report(uint64_t frame, uint64_t frames) {
         if (n && o < sizeof line - 160) o += snprintf(line + o, sizeof line - o, " %s %.2f/frame (blocked %.2f, %.3f ms);", ws_name[i], (double)n / frames, (double)b / frames, ns / 1e6 / frames); }
     MLOG("[waits] up to frame %llu, per frame:%s", (unsigned long long)frame, o ? line : " none");
 }
+static id<MTLRenderPipelineState> uis_float_pipeline(id<MTLRenderPipelineState> original);
+static id<MTLRenderPipelineState> uis_float_pipeline_cached(id<MTLRenderPipelineState> original);
+static void uis_float_pipeline_warm(id<MTLRenderPipelineState> original);
+static void res_add_at(id<MTLAllocation> allocation,int line);
+static void res_commit(void);
 #include "nvn_rec.h"   // deferred encoding (DM_NVN_ENC_THREAD)
 static NSHashTable *g_res_objects;
 static _Atomic unsigned g_image_heap_n, g_big_n;   // g_big_n: large pools in chunks, whose buffers overlap (BIG_MIN)
@@ -7107,6 +7112,7 @@ static unsigned vs_streams(const nvn_refl *rf) {   // the streams the vertex sha
 }
 // Returns the first stream the vertex shader reads (rf) whose non-zero address is in no memory pool, or -1. Such a slot would keep the buffer an earlier draw bound
 // there, so the caller skips the draw, as for an index buffer in no pool; a stream with address 0 reads the zero buffer through the vertex descriptor (ZERO_ATTR)
+static id<MTLBuffer> g_lui_vertex_zero; static uint64_t g_lui_vertex_zero_gpu;
 static int bind_vbufs(id<MTL4RenderCommandEncoder> en, const nvn_refl *rf) {
     static struct { uint64_t addr, gpu, gen; } cache[16];
     uint64_t gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
@@ -7127,9 +7133,8 @@ static int bind_vbufs(id<MTL4RenderCommandEncoder> en, const nvn_refl *rf) {
         }
         enc_r_vbuf(en, VB_SLOT(s), gpu);
     }
-    static id<MTLBuffer> zero; static uint64_t zero_gpu;
-    if (!zero) { zero = [g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared]; res_add(zero); zero_gpu = zero.gpuAddress; }
-    enc_r_vbuf(en, 30, zero_gpu);
+    if (!g_lui_vertex_zero) { g_lui_vertex_zero = [g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared]; res_add(g_lui_vertex_zero); g_lui_vertex_zero_gpu = g_lui_vertex_zero.gpuAddress; }
+    enc_r_vbuf(en, 30, g_lui_vertex_zero_gpu);
     return bad;
 }
 // The per-draw layout block of a pulling pipeline (dm/gfx/tools/dmsh_pull.metal dm_vlayout, at buffer 16): per stream the base address, stride and divisor, per NVN attribute its
@@ -8796,7 +8801,7 @@ static MTL4RenderPipelineDescriptor *spec_desc(id base, _Atomic int *own) {   //
 static _Atomic int g_spec_own;
 // The pipeline pso_desc describes: its base (built, from the archive or already made), then specialized with its colour state. Called on several threads.
 // compile 0: nil on an archive miss (*e untouched), with no MTLDevice fallback. Prewarm compaction may still refresh a found base for serialization.
-static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, NSError **e, int compile) {
+static id<MTLRenderPipelineState> pso_build_ex_original(MTLRenderPipelineDescriptor *d, NSError **e, int compile) {
     // Do not send conflicting or non-renderable aspect formats to Metal, which can
     // abort instead of returning an NSError (also on the MTLDevice fallback).
     if (!pso_ds_valid((uint32_t)d.depthAttachmentPixelFormat, (uint32_t)d.stencilAttachmentPixelFormat)) {
@@ -8873,6 +8878,7 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, N
     g_pt_spec_ns += bp_now() - ts;
     return ps;
 }
+#include "nvn_ui_scaled_pso.inc"
 static id<MTLRenderPipelineState> pso_build(MTLRenderPipelineDescriptor *d, NSError **e) { return pso_build_ex(d, e, 1); }
 // Pipeline key: current state S + pass formats (normal pass; a merged pass additionally carries lmap / specialized function, filled in by pso_get)
 static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t cfmt[8], uint32_t dfmt, uint32_t sfmt, uint32_t samples, int lmap) {
@@ -13610,6 +13616,7 @@ static void draw_multi(const p_multi_draw *m) {
     g_mdx_range = NULL;
     g_mdxc.next = NULL;
 }
+static void low_ui_note_draw(NvProg *pr,const p_draw *dw,const p_draw_idx *di,int cur_pull);
 static void draw_(const p_draw *dw, const p_draw_idx *di);
 #include "nvn_pixel_probe.inc"
 #include "nvn_pose_probe.inc"
@@ -13850,6 +13857,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
             if (g_vis_cur >= 0 && g_enc_vis != g_vis_cur + 1) { enc_r_visibility(en, MTLVisibilityResultModeCounting, (NSUInteger)g_vis_cur * 8); g_enc_vis = g_vis_cur + 1; }
         }
     }
+    low_ui_note_draw(pr,dw,di,cur_pull);
     pose_probe_note(pr,dw,di,cur_pull);
     px_probe_scope px_scope __attribute__((cleanup(px_probe_end)))=px_probe_begin(en,pr,sc,raster_mask);
     gp_note_fragment((__bridge const void*)en,pr->sh[1] && !S.rast_discard?pr->sh[1]->key:"0");
@@ -15302,6 +15310,10 @@ void mtl_exec(const uint8_t *p) {
 
 // ---------- Present: draw the swapchain texture to the CAMetalLayer; optional screenshot ----------
 static id<MTLRenderPipelineState> g_blit_pso; static MTLPixelFormat g_blit_fmt;
+static int low_route_sdr_texture(id<MTLTexture> texture);
+static int low_route_present_source(uint64_t serial,id<MTLTexture>*source,int crop[4]);
+static id<MTLRenderPipelineState> g_low_sdr_present_pso[2];
+static id<MTLRenderPipelineState> low_sdr_present_pipeline(MTLPixelFormat format);
 static id<MTLSamplerState> g_blit_samp;
 static uint64_t g_present_n;
 uint64_t mtl_present_count(void) { return g_present_n; }   // Actual present count (heat attribution DM_HEAT computes the present frame rate)
@@ -15393,8 +15405,10 @@ static void shot(id<MTLTexture> src, const char *path, int screen, const int cro
         if (e && sscanf(e, "%d%c%d%c", &w, &sep, &h, &extra) == 3 && sep == 'x' && w > 0 && h > 0) { out_w = w; out_h = h; }
     }
     id<MTLTexture> read = src;
-    if (out_w && screen) {
-        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:out_w height:out_h mipmapped:NO];
+    int output_w=out_w,output_h=out_h;
+    if(screen&&!output_w&&low_route_sdr_texture(src)){output_w=(int)src.width;output_h=(int)src.height;}
+    if (output_w && screen) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:output_w height:output_h mipmapped:NO];
         d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
         id<MTLTexture> out = [g_dev newTextureWithDescriptor:d];
         if (!out) { MLOG("[RED] cannot create the screenshot output texture %dx%d", out_w, out_h); return; }
@@ -15658,6 +15672,27 @@ static void present_pipeline(MTLPixelFormat format) {
         g_blit_samp = [g_dev newSamplerStateWithDescriptor:sd];
     }
 }
+// Private low-route SDR output: encode exactly once into an Unorm drawable.
+// Both variants are built before ARM; a live packet never compiles a pipeline.
+static id<MTLRenderPipelineState> low_sdr_present_pipeline(MTLPixelFormat format) {
+    int k=format==MTLPixelFormatBGRA8Unorm?0:format==MTLPixelFormatRGBA8Unorm?1:-1;
+    if(k<0)return nil;
+    if(g_low_sdr_present_pso[k])return g_low_sdr_present_pso[k];
+    if(low_ui_armed())return nil;
+    NSError *error=nil;id<MTLLibrary> vertex=host_lib("present",&error);
+    NSString *source=@"#include <metal_stdlib>\nusing namespace metal;\n"
+      "struct V{float4 p[[position]];float2 uv;};struct Crop{float4 rect;float4 edge;};"
+      "fragment float4 low_sdr_fs(V in[[stage_in]],texture2d<float> t[[texture(0)]],sampler s[[sampler(0)]],constant Crop& c[[buffer(0)]]){"
+      "float3 x=clamp(t.sample(s,clamp(in.uv*c.rect.zw+c.rect.xy,c.edge.xy,c.edge.zw)).rgb,0.0f,1.0f);"
+      "float3 y=select(1.055f*pow(x,float3(1.0f/2.4f))-0.055f,12.92f*x,x<=0.0031308f);return float4(y,1.0f);}";
+    id<MTLLibrary> fragment=[g_dev newLibraryWithSource:source options:nil error:&error];
+    if(!vertex||!fragment)return nil;
+    MTLRenderPipelineDescriptor *d=[MTLRenderPipelineDescriptor new];d.label=@"private low SDR terminal transfer";
+    d.vertexFunction=[vertex newFunctionWithName:@"vs"];d.fragmentFunction=[fragment newFunctionWithName:@"low_sdr_fs"];
+    d.colorAttachments[0].pixelFormat=format;
+    g_low_sdr_present_pso[k]=[g_dev newRenderPipelineStateWithDescriptor:d error:&error];
+    return g_low_sdr_present_pso[k];
+}
 // Present samples only the valid source rectangle declared by NVN; kept separate from the raw swapchain readback screenshot. Edges are clamped to the texel centers of the valid area, so bilinear does not read the black texels outside.
 // Present samples the raw bytes stored in the swapchain texture (the Switch's scan-out sends the stored bytes as they are): an sRGB source is replaced by a non-sRGB view of the same storage,
 // otherwise sampling decodes to linear first, the BGRA8Unorm layer does not encode again, and the whole picture comes out dark. Other formats are returned as they are (Mario's swapchain is RGBA8 and does not come here).
@@ -15706,7 +15741,7 @@ static int present_crop_rect(id<MTLTexture> src, const int crop[4], NSUInteger r
     }
     r[0] = crop[0]; r[1] = crop[1]; r[2] = crop[2]; r[3] = crop[3]; return 1;
 }
-static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4]) {
+static int present_encode_color(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4],int lowSDR) {
     NSUInteger r[4]; if (!present_crop_rect(src, crop, r)) return 0;
     NSUInteger cx = r[0], cy = r[1], cw = r[2], ch = r[3];
     static uint64_t last_crop[8]; uint64_t meta[8] = {src.width, src.height, cx, cy, cw, ch, dst.width, dst.height};
@@ -15714,6 +15749,7 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
         MLOG("present crop: source texture %lux%lu, valid %lu,%lu %lux%lu → target %lux%lu", (unsigned long)src.width, (unsigned long)src.height,
              (unsigned long)cx, (unsigned long)cy, (unsigned long)cw, (unsigned long)ch, (unsigned long)dst.width, (unsigned long)dst.height); }
     present_pipeline(dst.pixelFormat);
+    id<MTLRenderPipelineState> pipeline=lowSDR?low_sdr_present_pipeline(dst.pixelFormat):g_blit_pso;if(!pipeline)return 0;
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     double dw = dst.width, dh = dst.height;
     MTLViewport vp = present_fit(src, dw, dh);
@@ -15726,7 +15762,7 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
     [en setViewport:vp];
-    [en setRenderPipelineState:g_blit_pso]; [en setFragmentTexture:present_raw_src(src) atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
+    [en setRenderPipelineState:pipeline]; [en setFragmentTexture:present_raw_src(src) atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
     float uv[8] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
                    (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height};
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
@@ -15735,6 +15771,8 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     [en endEncoding];
     return 1;
 }
+static int present_encode(id<MTLCommandBuffer> cb,id<MTLTexture> src,id<MTLTexture> dst,const int crop[4]) {return present_encode_color(cb,src,dst,crop,low_route_sdr_texture(src));}
+
 // ---------- Upscaling in the present (DM_PRESENT_UPSCALE) ----------
 // Opt-in spatial scaling of the valid content to its letterboxed viewport. Copy the crop to an origin-aligned texture, scale in perceptual mode (present_raw_src supplies gamma
 // bytes), then draw 1:1 with the usual origin and output format. Queue barriers serialize both the frame's rendering and reuse of the scaler's textures across presents.
@@ -15898,6 +15936,7 @@ static up_mfx_scaler *up_mfx_scaler_for(NSUInteger iw, NSUInteger ih, NSUInteger
     e->sc = sc; e->in = in; e->out = out; e->read = read; e->refused = 0;
     return e;
 }
+#include "nvn_low_ui_submit.inc"
 #include "nvn_upscale_recipe.inc"
 
 // A rectangle of the push constants (origin, inclusive last texel relative to it) inside a w x h texture
@@ -15963,12 +16002,15 @@ static int up_mfx_encode(NvShader *cs, const p_dispatch *dp) {
     return 1;
 }
 #include "nvn_temporal_preview.inc"
+#include "nvn_low_read_contract.inc"
 
 // The present pass: src's valid rectangle drawn into dst (the drawable, or a screenshot's texture) as present_encode draws it, through MetalFX first where fx_encode takes it
 // (fx: the scaler state to use, nil = bilinear). uvb: the pass's crop constants (one buffer per present allocator, written by the CPU)
 static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], id<MTLBuffer> uvb, fx_state *fx) {
     NSUInteger r[4]; if (!present_crop_rect(src, crop, r)) return 0;
     present_pipeline(dst.pixelFormat);
+    int lowSDR=low_route_sdr_texture(src);if(lowSDR)fx=NULL;
+    id<MTLRenderPipelineState> pipeline=lowSDR?low_sdr_present_pipeline(dst.pixelFormat):g_blit_pso;if(!pipeline)return 0;
     double dw = dst.width, dh = dst.height;
     MTLViewport vp = present_fit(src, dw, dh);
     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
@@ -15990,7 +16032,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     uv[4] = (cx + 0.5f) / tw; uv[5] = (cy + 0.5f) / th; uv[6] = (cx + cw - 0.5f) / tw; uv[7] = (cy + ch - 0.5f) / th;
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
     [g_present_args setAddress:uvb.gpuAddress atIndex:0];
-    [en setViewport:vp]; [en setRenderPipelineState:g_blit_pso];
+    [en setViewport:vp]; [en setRenderPipelineState:pipeline];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     m4_end(en);
     return up ? PRESENT_METALFX : PRESENT_STANDARD;
@@ -16102,6 +16144,8 @@ static int present_now_kind(const tex_t *t, double period, uint64_t frame, uint6
     PD("X ser=%llu", t->serial);
     id<MTLTexture> src = tex_mtl(t);
     if (!src) { RED_ONCE(8, "present texture could not get an MTLTexture"); return 0; }
+    int lowResolvedCrop[4];
+    if(low_route_present_source(t->serial,&src,lowResolvedCrop))crop=lowResolvedCrop;
     // The picture's shape for the front end's layout (front.h front_picture_shape): reported when its width / height changes by more than 0.1 %, not on a size change of the same
     // shape (1280x720 handheld, 1920x1080 docked)
     { static double last; double w, h; present_shape(src, &w, &h); double a = w / h;
@@ -16521,11 +16565,17 @@ static id<MTL4CommandAllocator> g_snap_alloc[SNAP_MAX]; static id<MTL4CommandBuf
 static id<MTLResidencySet> g_snap_res; static id<MTLSharedEvent> g_snap_ev; static uint64_t g_snap_v;
 static _Atomic uint64_t g_snap_next, g_snap_cmt;   // g_snap_cmt: the last copy the encode thread has committed (its g_snap_v)
 static int g_snap_n = 2;
+static uint64_t low_route_ui_reader(unsigned slot);
+static id<MTLSharedEvent> low_route_ui_event(void);
+static void low_route_drain(void);
+static int low_route_display(unsigned slot,uint64_t serial,id<MTLTexture>*texture,id<MTLSharedEvent>*event,uint64_t*value);
 #include "nvn_temporal_snapshot.inc"
+#include "nvn_low_route.inc"
 
 // SIGTERM's graceful host shutdown drains graphics, then uses _exit rather than
 // exit. Flush only our owned streams, under their writers' locks, outside play.
 static void framegen_diagnostics_flush(void) {
+    low_route_export_stats();
     pthread_mutex_t *locks[]={&g_framegen_presented_mu,&g_framegen_async_gpu_mu,&g_framegen_snapshot_gpu_mu};
     FILE **files[]={&g_framegen_presented_file,&g_framegen_async_gpu_file,&g_framegen_snapshot_gpu_file};
     for(unsigned i=0;i<3;i++) {
@@ -16618,6 +16668,7 @@ static uint64_t snap_take(const tex_t *t,const int present_crop[4],uint64_t *gen
         if(at)nvn_flow_event(busy?"snapshot slot busy":"snapshot copy pending",atomic_load(&g_cur_frame),0,at,nvn_flow_clock());
         return 0;
     }
+    int lowPrepared=low_route_wanted()&&low_route_prepare();
     temporal_async_readers old_reader=temporal_async_reader((unsigned)k);
     // The texture this slot held before it was last replaced: every present that read it had been committed when the replacing copy was (the busy check then), and the queue
     // signals g_snap_ev only after all work committed before the signal, so those presents have run and it can leave the residency set
@@ -16678,9 +16729,14 @@ static uint64_t snap_take(const tex_t *t,const int present_crop[4],uint64_t *gen
                  (unsigned long long)g_temporal_pair_final_serial,(unsigned long long)t->serial,
                  front_screen_max_fps(),g_temporal_pair_viewport[0],g_temporal_pair_viewport[1],g_temporal_pair_viewport[2],g_temporal_pair_viewport[3]);
     }
-    if(temporal_preview_on()==3 && front_screen_max_fps()>=120 && g_temporal_pair_final_frame==frame && g_temporal_pair_final_serial==t->serial)
-        *generated=temporal_snap_encode_producer(cb,k,hdr?dst:src,g_temporal_pair_viewport,frame,now_ns(),g_temporal_full_scene,g_temporal_pair_ui,g_temporal_game_depth,g_temporal_full_camera,g_snap_ev,g_snap_v+1,present_crop);
+    if(temporal_preview_on()==3 && front_screen_max_fps()>=120 && g_temporal_pair_final_frame==frame && g_temporal_pair_final_serial==t->serial) {
+        id<MTLTexture> lowTarget=hdr?g_hdr_native_linear:
+            (g_low_sdr_final_frame==frame && g_low_sdr_final_window==t->serial && present_crop && present_crop[0]==0 && present_crop[1]==0 && present_crop[2]==2048 && present_crop[3]==1152?g_low_sdr_final_source:nil);
+        int used=lowPrepared&&low_route_encode(cb,k,frame,now_ns(),lowTarget,g_temporal_game_depth,g_temporal_full_camera,g_snap_ev,g_snap_v+1,generated);
+        if(!used){low_route_disable(k);*generated=temporal_snap_encode_producer(cb,k,hdr?dst:src,g_temporal_pair_viewport,frame,now_ns(),g_temporal_full_scene,g_temporal_pair_ui,g_temporal_game_depth,g_temporal_full_camera,g_snap_ev,g_snap_v+1,present_crop);}
+    }
     else if(temporal_preview_on()==3) {
+        low_route_disable(k);
         double at=nvn_flow_begin();
         if(at)nvn_flow_event(g_temporal_pair_final_frame!=frame?"snapshot final frame missing":g_temporal_pair_final_serial!=t->serial?"snapshot final serial mismatch":"snapshot screen below 120",frame,0,at,nvn_flow_clock());
     }
@@ -16698,7 +16754,7 @@ static uint64_t snap_take(const tex_t *t,const int present_crop[4],uint64_t *gen
     if (rec_on() && g_rb_started) {   // a block of the encode thread's queue, behind the frame's work (see above)
         if (on_sub_thread()) rec_publish();   // what the submitting thread recorded outside a submission goes first
         rec_blk *b = rec_own_begin();
-        if(old_reader.generation || old_reader.presentation){rec_t *wait=rec_own_put(b,RO_Q_BLOCK,1);wait->a[0]=rec_obj([^{temporal_async_copy_wait(old_reader);} copy]);}
+        if(old_reader.generation || old_reader.presentation || old_reader.low_ui){rec_t *wait=rec_own_put(b,RO_Q_BLOCK,1);wait->a[0]=rec_obj([^{temporal_async_copy_wait(old_reader);} copy]);}
         rec_t *r = rec_own_put(b, RO_COMMIT_REAL, 2); r->a[0] = rec_obj(options); r->a[1] = rec_obj(cb);
         r = rec_own_put(b, RO_SIGNAL, 1); r->a[0] = rec_obj(g_snap_ev); r->a[1] = v;
         r = rec_own_put(b, RO_NOTE, 0); r->a[0] = (uint64_t)(uintptr_t)&g_snap_cmt; r->a[1] = v;
